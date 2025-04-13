@@ -15,7 +15,7 @@ use crate::utils::parse_size;
 use std::io::{self, Write};
 use crate::mount::EncryptedFsHandler;
 use crate::platform::windows::{check_drive_letter_availability, check_dokan_driver};
-use dokan_rust::{Dokan, MountFlags, MountPoint};
+use dokan::{Dokan, MountFlags, MountPoint, MountOptions};
 
 /// Структура для парсинга аргументов командной строки
 #[derive(Parser, Debug)]
@@ -274,7 +274,7 @@ fn handle_unlock(args: UnlockArgs) -> anyhow::Result<()> {
     info!("Заголовок успешно десериализован. Версия: {}", header.version());
 
     // ---> Проверка сигнатуры и версии <-----
-    if header.signature() != *VOLUME_SIGNATURE {
+    if header.signature() != VOLUME_SIGNATURE {
         bail!("Неверная сигнатура тома. Это не устройство UniFortress или оно повреждено.");
     }
     if header.version() != HEADER_VERSION {
@@ -332,23 +332,25 @@ fn handle_unlock(args: UnlockArgs) -> anyhow::Result<()> {
         let fs_handler = EncryptedFsHandler::new(volume, xts_key);
         
         // Настраиваем опции монтирования
-        let mount_options = MountFlags::DEFAULT | MountFlags::REMOVABLE_DRIVE;
-        let mount_point = MountPoint::new(&mount_point_str)
-            .with_context(|| format!("Не удалось создать точку монтирования '{}'", mount_point_str))?;
+        let mount_options = MountOptions {
+            mount_point: mount_point_str,
+            options: dokan::MountFlags::REMOVABLE,
+            ..Default::default()
+        };
 
         // Создаем и запускаем Dokan
         // Это блокирующий вызов - он будет работать, пока диск не будет размонтирован
         info!("Инициализация Dokan для точки монтирования {}", mount_point_str);
-        let dokan = Dokan::new(mount_point, fs_handler, &mount_options);
-        match dokan.mount() {
-            Ok(handle) => {
+        
+        match dokan::Drive::mount(fs_handler, &mount_options) {
+            Ok(drive) => {
                 println!("Диск успешно смонтирован на {}.", mount_point_str);
                 println!("Теперь вы можете получить доступ к данным через проводник или командную строку.");
                 println!("Нажмите Ctrl+C для размонтирования и завершения работы программы.");
                 
                 info!("Диск успешно смонтирован на {}. Ожидание сигнала для размонтирования.", mount_point_str);
                 // Ждем завершения (например, по Ctrl+C или другому сигналу)
-                handle.join(); // Ожидаем завершения работы Dokan
+                drive.join(); // Ожидаем завершения работы Dokan
                 info!("Диск размонтирован.");
                 println!("Диск успешно размонтирован. Доступ к зашифрованным данным прекращен.");
             },

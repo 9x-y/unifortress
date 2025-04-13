@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 # Криптография
 aes = "0.8"
-xts-mode = "0.9"
+xts-mode = { git = "https://github.com/pheki/xts-mode", version = "0.5.1", features = ["std"] }
 hmac = "0.12"
 sha2 = "0.10"
 argon2 = "0.5"
@@ -28,5 +28,10 @@ clap = { version = "4.4", features = ["derive"] } # 'derive' фича для у�
 
 rpassword = "7.3"
 
+# UUID
+uuid = { version = "1.7", features = ["v4"] }
+
 # Для монтирования виртуального диска в Windows
-dokan-rust = "0.2" # Указываем версию (может потребоваться обновление)
+dokan = "0.2" # Используем dokan вместо dokan-rust
+dokan-sys = "0.2" # Добавляем зависимость на dokan-sys
+winapi = { version = "0.3.9", features = ["winioctl", "ioapiset", "minwinbase", "minwindef"] }

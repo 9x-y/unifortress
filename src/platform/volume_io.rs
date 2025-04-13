@@ -3,6 +3,8 @@ use log::{debug, trace};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 
 /// Определяем виртуальный размер сектора для работы внутри файла-контейнера.
 /// 4096 байт - частый размер сектора для современных дисков и ФС.
@@ -12,20 +14,45 @@ const VIRTUAL_SECTOR_SIZE: u32 = 4096;
 pub struct VolumeFile {
     file: File, // Обертка над стандартным файлом
     path: PathBuf, // Сохраняем путь для сообщений об ошибках
+    is_physical: bool, // Флаг для работы с физическим устройством
+    real_sector_size: Option<u32>, // Реальный размер сектора для физического устройства
 }
 
 impl VolumeFile {
     /// Открывает существующий файл-контейнер для чтения и записи.
-    pub fn open(file_path: &Path) -> Result<Self> {
+    pub fn open(file_path: &str, is_physical: bool) -> Result<Self> {
+        let path = if is_physical {
+            // Windows-специфичный код для открытия физического устройства
+            // На Windows путь к физическим устройствам выглядит как \\.\PhysicalDriveX
+            PathBuf::from(file_path)
+        } else {
+            PathBuf::from(file_path)
+        };
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(file_path)
-            .with_context(|| format!("Не удалось открыть файл '{}'", file_path.display()))?;
-        debug!("Файл-контейнер '{}' открыт.", file_path.display());
+            .create(false) // Не создавать, если не существует
+            .open(&path)
+            .with_context(|| format!("Не удалось открыть '{}'", file_path))?;
+        
+        // Определяем реальный размер сектора для физического устройства
+        let real_sector_size = if is_physical {
+            Some(Self::get_physical_sector_size(&file)?)
+        } else {
+            None
+        };
+        
+        debug!("Файл '{}' открыт. Физическое устройство: {}", file_path, is_physical);
+        if is_physical {
+            debug!("Реальный размер сектора: {} байт", real_sector_size.unwrap());
+        }
+        
         Ok(VolumeFile { 
             file, 
-            path: file_path.to_path_buf() 
+            path, 
+            is_physical,
+            real_sector_size
         })
     }
 
@@ -50,7 +77,9 @@ impl VolumeFile {
         debug!("Новый файл-контейнер '{}' размером {} байт создан.", file_path.display(), size_bytes);
         Ok(VolumeFile { 
             file, 
-            path: file_path.to_path_buf() 
+            path: file_path.to_path_buf(),
+            is_physical: false,
+            real_sector_size: None
         })
     }
 
@@ -60,14 +89,112 @@ impl VolumeFile {
     }
 
     /// Возвращает общий размер файла-контейнера в байтах.
-    pub fn get_file_size(&self) -> Result<u64> {
-        let metadata = self.file.metadata()
-            .with_context(|| format!("Не удалось получить метаданные файла '{}'", self.path.display()))?;
-        Ok(metadata.len())
+    pub fn get_size(&self) -> Result<u64> {
+        if self.is_physical {
+            self.get_physical_device_size()
+        } else {
+            let metadata = self.file.metadata()
+                .with_context(|| format!("Не удалось получить метаданные файла '{}'", self.path.display()))?;
+            Ok(metadata.len())
+        }
     }
 
-     /// Читает данные из файла, начиная с указанного байтового смещения.
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<()> {
+    /// Возвращает размер физического устройства в байтах.
+    fn get_physical_device_size(&self) -> Result<u64> {
+        if !self.is_physical {
+            bail!("Метод доступен только для физических устройств");
+        }
+        
+        // Для Windows используем DeviceIoControl с IOCTL_DISK_GET_LENGTH_INFO
+        use winapi::um::winioctl::IOCTL_DISK_GET_LENGTH_INFO;
+        use winapi::um::ioapiset::DeviceIoControl;
+        use winapi::shared::minwindef::DWORD;
+        use winapi::um::minwinbase::OVERLAPPED;
+        use winapi::shared::ntdef::NULL;
+        use std::os::windows::io::AsRawHandle;
+        
+        // Структура GET_LENGTH_INFORMATION из winioctl.h
+        #[repr(C)]
+        struct GetLengthInformation {
+            length: u64,
+        }
+        
+        let mut length_info = GetLengthInformation { length: 0 };
+        let mut bytes_returned: DWORD = 0;
+        
+        let result = unsafe {
+            DeviceIoControl(
+                self.file.as_raw_handle() as *mut _,
+                IOCTL_DISK_GET_LENGTH_INFO,
+                NULL,
+                0,
+                &mut length_info as *mut _ as *mut _,
+                std::mem::size_of::<GetLengthInformation>() as DWORD,
+                &mut bytes_returned,
+                std::ptr::null_mut::<OVERLAPPED>(),
+            )
+        };
+        
+        if result == 0 {
+            let error = std::io::Error::last_os_error();
+            bail!("Не удалось получить размер физического устройства: {}", error);
+        }
+        
+        Ok(length_info.length)
+    }
+
+    /// Определяет физический размер сектора устройства.
+    fn get_physical_sector_size(file: &File) -> Result<u32> {
+        // Для Windows используем DeviceIoControl с IOCTL_DISK_GET_DRIVE_GEOMETRY
+        use winapi::um::winioctl::IOCTL_DISK_GET_DRIVE_GEOMETRY;
+        use winapi::um::ioapiset::DeviceIoControl;
+        use winapi::shared::minwindef::DWORD;
+        use winapi::um::minwinbase::OVERLAPPED;
+        use winapi::shared::ntdef::NULL;
+        use std::os::windows::io::AsRawHandle;
+        
+        // Структура DISK_GEOMETRY из winioctl.h
+        #[repr(C)]
+        struct DiskGeometry {
+            cylinders: i64,
+            media_type: i32,
+            tracks_per_cylinder: DWORD,
+            sectors_per_track: DWORD,
+            bytes_per_sector: DWORD,
+        }
+        
+        let mut disk_geometry = DiskGeometry {
+            cylinders: 0,
+            media_type: 0,
+            tracks_per_cylinder: 0,
+            sectors_per_track: 0,
+            bytes_per_sector: 0,
+        };
+        let mut bytes_returned: DWORD = 0;
+        
+        let result = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle() as *mut _,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                NULL,
+                0,
+                &mut disk_geometry as *mut _ as *mut _,
+                std::mem::size_of::<DiskGeometry>() as DWORD,
+                &mut bytes_returned,
+                std::ptr::null_mut::<OVERLAPPED>(),
+            )
+        };
+        
+        if result == 0 {
+            let error = std::io::Error::last_os_error();
+            bail!("Не удалось получить геометрию диска: {}", error);
+        }
+        
+        Ok(disk_geometry.bytes_per_sector)
+    }
+
+    /// Читает данные из файла, начиная с указанного байтового смещения.
+    pub fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<()> {
         trace!("Reading {} bytes from offset {}", buffer.len(), offset);
         self.file.seek(SeekFrom::Start(offset))
              .with_context(|| format!("Ошибка позиционирования для чтения в файле '{}' на смещение {}", self.path.display(), offset))?;
@@ -76,8 +203,8 @@ impl VolumeFile {
         Ok(())
     }
 
-     /// Записывает данные в файл, начиная с указанного байтового смещения.
-    fn write_at(&mut self, offset: u64, buffer: &[u8]) -> Result<()> {
+    /// Записывает данные в файл, начиная с указанного байтового смещения.
+    pub fn write_at(&mut self, offset: u64, buffer: &[u8]) -> Result<()> {
         trace!("Writing {} bytes to offset {}", buffer.len(), offset);
         self.file.seek(SeekFrom::Start(offset))
              .with_context(|| format!("Ошибка позиционирования для записи в файле '{}' на смещение {}", self.path.display(), offset))?;
@@ -109,7 +236,7 @@ impl VolumeFile {
         self.read_at(offset, buffer)
     }
 
-     /// Записывает данные в указанное количество виртуальных секторов, начиная с заданного индекса.
+    /// Записывает данные в указанное количество виртуальных секторов, начиная с заданного индекса.
     pub fn write_sectors(
         &mut self,
         start_sector: u64,
