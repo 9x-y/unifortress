@@ -1,1014 +1,759 @@
-use anyhow::{Result, bail, Context};
-use std::process::Command;
-use std::fs::{OpenOptions, File};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
-use std::os::windows::io::FromRawHandle;
-use rand::{Rng, rngs::OsRng};
+use std::process::Command;
+use std::cmp::min;
+use anyhow::{Result, Context, anyhow, bail};
+use clap::{Parser, Subcommand};
 use rpassword::read_password;
+use sha2::{Sha256, Digest};
+use sha2::digest::KeyInit;
+use rand::{rngs::OsRng, RngCore};
+use rand::RngCore as _;
+use aes::Aes256;
+use xts_mode::Xts128 as Xts;
+use env_logger;
+use unifortress::mount;
+use log::{debug, error, info, warn, LevelFilter};
 use std::path::Path;
-use std::ptr;
-use std::mem;
-use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
-use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE};
-use winapi::um::winioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY};
-use winapi::um::winioctl::FSCTL_LOCK_VOLUME;
-use winapi::um::winioctl::FSCTL_DISMOUNT_VOLUME;
-use winapi::um::ioapiset::DeviceIoControl;
-use winapi::shared::minwindef::DWORD;
-use std::ffi::CString;
+use std::time::Instant;
+use unifortress::encryption;
+use unifortress::platform::volume_io;
+use unifortress::decryption;
+use unifortress::deferred::DeferredEncryptedVolume;
 
-use unifortress::encryption::{derive_key, split_derived_key, VolumeHeader};
-use unifortress::decryption::decrypt_sector;
-use unifortress::crypto::xts::encrypt_sector;
+// Constants
+const HEADER_SIZE: usize = 4096; // 4KB for header
+const SECTOR_SIZE: usize = 512; // Standard sector size
+const SALT_SIZE: usize = 32; // Salt size
+const KEY_SIZE: usize = 64; // 512 bits for XTS (2 keys, 256 bits each)
 
-const SECTOR_SIZE: u32 = 4096;
-const HEADER_SECTORS: u64 = 2; // First two sectors for header
-const SALT_SIZE: usize = 16; // Argon2 salt size (16 bytes recommended)
-
-// Define a common trait for both volume types
-trait Volume {
-    fn get_size(&self) -> Result<u64>;
-    fn get_sector_size(&self) -> u32;
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<()>;
-    fn write_at(&mut self, offset: u64, buffer: &[u8]) -> Result<()>;
-    fn read_sectors(&mut self, start_sector: u64, num_sectors: u32, sector_size: u32, buffer: &mut [u8]) -> Result<()>;
-    fn write_sectors(&mut self, start_sector: u64, sector_size: u32, buffer: &[u8]) -> Result<()>;
-    fn lock_and_dismount(&mut self) -> Result<()>;
+#[derive(Parser)]
+#[command(author, version, about = "UniFortress - USB drive encryption utility")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-// Generate cryptographically secure random salt
-fn generate_salt(size: usize) -> Vec<u8> {
-    let mut salt = vec![0u8; size];
-    OsRng.fill(&mut salt[..]);
-    salt
-}
-
-fn get_disk_info(disk_number: u8) -> Result<String> {
-    // Use PowerShell to get disk information with GB size
-    let cmd = format!(
-        "Get-Disk -Number {} | Select-Object Number, FriendlyName, @{{Name='SizeGB';Expression={{\"{{0:N2}} GB\" -f ($_.Size / 1GB)}}}} , BusType, PartitionStyle | Format-List; Get-Partition -DiskNumber {} | Select-Object DriveLetter, @{{Name='SizeGB';Expression={{\"{{0:N2}} GB\" -f ($_.Size / 1GB)}}}} , Type | Format-Table -AutoSize", 
-        disk_number, 
-        disk_number
-    );
-    
-    let output = Command::new("powershell")
-        .args(&[
-            "-Command",
-            &cmd
-        ])
-        .output()
-        .context("Failed to execute PowerShell command to get disk information")?;
-
-    if !output.status.success() {
-        bail!("Command execution error: {}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-// Get list of available disks
-fn list_available_disks() -> Result<String> {
-    println!("Scanning for available disks...");
-    
-    let cmd = "Get-Disk | Select-Object Number, FriendlyName, @{Name='SizeGB';Expression={\"[{0:N2} GB]\" -f ($_.Size / 1GB)}}, BusType, PartitionStyle | Format-Table -AutoSize";
-    
-    let output = Command::new("powershell")
-        .args(&[
-            "-Command",
-            cmd
-        ])
-        .output()
-        .context("Failed to execute PowerShell command to list disks")?;
-
-    if !output.status.success() {
-        bail!("Command execution error: {}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-// Function to test direct disk access via standard library
-fn test_direct_disk_access(disk_number: u8) -> Result<()> {
-    let path = format!(r"\\.\PhysicalDrive{}", disk_number);
-    println!("Testing direct disk access via std::fs::OpenOptions: {}", path);
-    
-    match OpenOptions::new().read(true).write(true).open(&path) {
-        Ok(_) => {
-            println!("[OK] Access granted via standard library");
-            Ok(())
-        },
-        Err(e) => {
-            println!("[ERROR] Access error via standard library: {} (os error {})", 
-                     e, e.raw_os_error().unwrap_or(-1));
-            bail!("Failed to get disk access via std::fs")
-        }
-    }
-}
-
-// Physical device implementation for VolumeFile
-struct PhysicalDiskVolume {
-    file: File,
-    sector_size: u32,
-    disk_number: u8,
-    handle: winapi::um::winnt::HANDLE,
-}
-
-impl PhysicalDiskVolume {
-    fn open(disk_number: u8, sector_size: u32) -> Result<Self> {
-        let path = format!(r"\\.\PhysicalDrive{}", disk_number);
-        println!("Opening physical disk: {}", path);
+#[derive(Subcommand)]
+enum Commands {
+    /// Encrypt USB drive
+    Encrypt {
+        /// Drive letter (Windows only) or device path
+        #[arg(short, long)]
+        device: String,
+    },
+    /// Fast encrypt USB drive (deferred encryption)
+    FastEncrypt {
+        /// Drive letter (Windows only) or device path
+        #[arg(short, long)]
+        device: String,
+    },
+    /// Check encrypted USB drive
+    Check {
+        /// Drive letter (Windows only) or device path
+        #[arg(short, long)]
+        device: String,
+    },
+    /// List available drives
+    List,
+    /// Mount encrypted USB drive
+    Mount {
+        /// Drive letter (Windows only) or device path
+        #[arg(short, long)]
+        device: String,
         
-        // Use WinAPI for low-level disk access with full control
-        unsafe {
-            let path_cstr = CString::new(path.clone()).unwrap();
-            let handle = CreateFileA(
-                path_cstr.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                ptr::null_mut(),
-                OPEN_EXISTING,
-                0,
-                ptr::null_mut(),
-            );
-            
-            if handle == winapi::um::handleapi::INVALID_HANDLE_VALUE {
-                let error = std::io::Error::last_os_error();
-                println!("[ERROR] Failed to open disk with WinAPI: {}", error);
-                bail!("Could not open physical disk: {}", error);
-            }
-            
-            println!("[OK] Successfully opened disk using WinAPI");
-            
-            // Get disk geometry to verify sector size
-            let mut geometry: DISK_GEOMETRY = mem::zeroed();
-            let mut bytes_returned: DWORD = 0;
-            
-            let result = DeviceIoControl(
-                handle,
-                IOCTL_DISK_GET_DRIVE_GEOMETRY,
-                ptr::null_mut(),
-                0,
-                &mut geometry as *mut _ as *mut _,
-                mem::size_of::<DISK_GEOMETRY>() as DWORD,
-                &mut bytes_returned,
-                ptr::null_mut(),
-            );
-            
-            if result == 0 {
-                let error = std::io::Error::last_os_error();
-                println!("[WARNING] Failed to get disk geometry: {}", error);
-                println!("Using specified sector size: {}", sector_size);
-            } else {
-                let disk_sector_size = geometry.BytesPerSector;
-                println!("Disk geometry: {} bytes per sector", disk_sector_size);
-                
-                if disk_sector_size != sector_size as DWORD {
-                    println!("[WARNING] Disk sector size ({}) differs from specified sector size ({})",
-                             disk_sector_size, sector_size);
-                    println!("Using specified sector size for encryption: {}", sector_size);
-                }
-            }
-            
-            // Convert HANDLE to File
-            let file = File::from_raw_handle(handle as *mut _);
-            
-            Ok(Self {
-                file,
-                sector_size,
-                disk_number,
-                handle: handle,
-            })
-        }
-    }
-    
-    // Function to lock and dismount volume for exclusive access
-    fn lock_volume(&mut self) -> Result<bool> {
-        unsafe {
-            let mut bytes_returned: DWORD = 0;
-            
-            // Try to lock the volume
-            println!("Attempting to lock the volume for exclusive access...");
-            let lock_result = DeviceIoControl(
-                self.handle,
-                FSCTL_LOCK_VOLUME,
-                ptr::null_mut(),
-                0,
-                ptr::null_mut(),
-                0,
-                &mut bytes_returned,
-                ptr::null_mut()
-            );
-            
-            if lock_result == 0 {
-                let error = std::io::Error::last_os_error();
-                println!("[WARNING] Could not lock volume: {}", error);
-                println!("The disk may be in use by another process.");
-                return Ok(false);
-            }
-            
-            // Try to dismount the volume
-            println!("Attempting to dismount the volume...");
-            let dismount_result = DeviceIoControl(
-                self.handle,
-                FSCTL_DISMOUNT_VOLUME,
-                ptr::null_mut(),
-                0,
-                ptr::null_mut(),
-                0,
-                &mut bytes_returned,
-                ptr::null_mut()
-            );
-            
-            if dismount_result == 0 {
-                let error = std::io::Error::last_os_error();
-                println!("[WARNING] Could not dismount volume: {}", error);
-                println!("Continuing anyway, but operations may fail...");
-                return Ok(false);
-            }
-            
-            println!("[OK] Volume successfully locked and dismounted for exclusive access");
-            Ok(true)
-        }
-    }
-}
-
-// Implement Volume trait for PhysicalDiskVolume
-impl Volume for PhysicalDiskVolume {
-    fn get_size(&self) -> Result<u64> {
-        // Use PowerShell to get disk size - more reliable for physical devices
-        let cmd = format!(
-            "Get-Disk -Number {} | Select-Object -ExpandProperty Size",
-            self.disk_number
-        );
-        
-        let output = Command::new("powershell")
-            .args(&[
-                "-Command",
-                &cmd
-            ])
-            .output()
-            .context("Failed to execute PowerShell command to get disk size")?;
-
-        if !output.status.success() {
-            // If failed to get size via PowerShell, use a fixed value
-            println!("Failed to get actual disk size. Using fallback size of 60 GB.");
-            return Ok(60 * 1024 * 1024 * 1024); // 60 GB as safe value for most flash drives
-        }
-
-        let size_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        match size_str.parse::<u64>() {
-            Ok(size) => Ok(size),
-            Err(_) => {
-                println!("Failed to parse disk size '{}'. Using fallback size of 60 GB.", size_str);
-                Ok(60 * 1024 * 1024 * 1024) // 60 GB as safe value
-            }
-        }
-    }
-    
-    fn get_sector_size(&self) -> u32 {
-        self.sector_size
-    }
-    
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<()> {
-        self.file.seek(SeekFrom::Start(offset))
-            .context("Error positioning for reading")?;
-        self.file.read_exact(buffer)
-            .context("Error reading from device")?;
-        Ok(())
-    }
-    
-    fn write_at(&mut self, offset: u64, buffer: &[u8]) -> Result<()> {
-        // First try with the regular method
-        let result = self.file.seek(SeekFrom::Start(offset))
-            .and_then(|_| self.file.write_all(buffer))
-            .and_then(|_| self.file.flush());
-        
-        if result.is_err() {
-            // If that fails, try with direct WinAPI calls
-            unsafe {
-                let mut bytes_written: DWORD = 0;
-                
-                // Get the file handle
-                let handle = self.handle;
-                
-                // Position at the right offset (low and high parts of 64-bit offset)
-                let mut overlapped: winapi::um::minwinbase::OVERLAPPED = mem::zeroed();
-                
-                // Access OVERLAPPED union field correctly
-                // OVERLAPPED has a union 'u' that contains Anonymous struct with Offset and OffsetHigh
-                // We need to access it through that structure
-                // First create a pointer to the overlapped structure
-                let p_overlapped = &mut overlapped as *mut winapi::um::minwinbase::OVERLAPPED;
-                
-                // Now access the union fields using the proper method
-                unsafe {
-                    // Access the union and set Offset and OffsetHigh
-                    (*p_overlapped).u.s_mut().Offset = (offset & 0xFFFFFFFF) as DWORD;
-                    (*p_overlapped).u.s_mut().OffsetHigh = ((offset >> 32) & 0xFFFFFFFF) as DWORD;
-                }
-                
-                // Write using WriteFile
-                let result = winapi::um::fileapi::WriteFile(
-                    handle,
-                    buffer.as_ptr() as *const _,
-                    buffer.len() as DWORD,
-                    &mut bytes_written,
-                    &mut overlapped
-                );
-                
-                if result == 0 {
-                    let error = std::io::Error::last_os_error();
-                    bail!("Error writing to device using WinAPI: {}", error);
-                }
-                
-                if bytes_written != buffer.len() as DWORD {
-                    bail!("Incomplete write: wrote {} out of {} bytes", bytes_written, buffer.len());
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    fn read_sectors(&mut self, start_sector: u64, _num_sectors: u32, sector_size: u32, buffer: &mut [u8]) -> Result<()> {
-        let offset = start_sector * sector_size as u64;
-        self.read_at(offset, buffer)
-    }
-    
-    fn write_sectors(&mut self, start_sector: u64, sector_size: u32, buffer: &[u8]) -> Result<()> {
-        let offset = start_sector * sector_size as u64;
-        self.write_at(offset, buffer)
-    }
-    
-    fn lock_and_dismount(&mut self) -> Result<()> {
-        self.lock_volume()?;
-        Ok(())
-    }
-}
-
-// TestFileVolume structure for file operations
-struct TestFileVolume {
-    file: File,
-    sector_size: u32,
-    disk_number: u8,
-}
-
-impl TestFileVolume {
-    fn new(file: File, sector_size: u32, disk_number: u8) -> Self {
-        Self {
-            file,
-            sector_size,
-            disk_number,
-        }
-    }
-}
-
-// Implement Volume trait for TestFileVolume
-impl Volume for TestFileVolume {
-    fn get_size(&self) -> Result<u64> {
-        let metadata = self.file.metadata()
-            .context("Failed to get file metadata")?;
-        Ok(metadata.len())
-    }
-    
-    fn get_sector_size(&self) -> u32 {
-        self.sector_size
-    }
-    
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<()> {
-        self.file.seek(SeekFrom::Start(offset))
-            .context("Error positioning for reading")?;
-        self.file.read_exact(buffer)
-            .context("Error reading from file")?;
-        Ok(())
-    }
-    
-    fn write_at(&mut self, offset: u64, buffer: &[u8]) -> Result<()> {
-        self.file.seek(SeekFrom::Start(offset))
-            .context("Error positioning for writing")?;
-        self.file.write_all(buffer)
-            .context("Error writing to file")?;
-        self.file.flush()
-            .context("Error flushing to file")?;
-        Ok(())
-    }
-    
-    fn read_sectors(&mut self, start_sector: u64, _num_sectors: u32, sector_size: u32, buffer: &mut [u8]) -> Result<()> {
-        let offset = start_sector * sector_size as u64;
-        self.read_at(offset, buffer)
-    }
-    
-    fn write_sectors(&mut self, start_sector: u64, sector_size: u32, buffer: &[u8]) -> Result<()> {
-        let offset = start_sector * sector_size as u64;
-        self.write_at(offset, buffer)
-    }
-    
-    fn lock_and_dismount(&mut self) -> Result<()> {
-        // No need to lock or dismount file-based volumes
-        Ok(())
-    }
-}
-
-// Function to request password from user
-fn get_password() -> Result<String> {
-    println!("Enter password for disk encryption (will not be displayed): ");
-    let password = read_password()?;
-    
-    if password.trim().is_empty() {
-        println!("Password cannot be empty!");
-        return get_password();
-    }
-    
-    println!("Confirm password: ");
-    let confirm_password = read_password()?;
-    
-    if password != confirm_password {
-        println!("Passwords don't match! Try again.");
-        return get_password();
-    }
-    
-    Ok(password)
-}
-
-fn verify_password() -> Result<String> {
-    println!("Enter password to decrypt volume (will not be displayed): ");
-    let password = read_password()?;
-    
-    if password.trim().is_empty() {
-        println!("Password cannot be empty!");
-        return verify_password();
-    }
-    
-    Ok(password)
-}
-
-// Add new function to run diskpart for disk preparation
-fn prepare_disk_with_diskpart(disk_number: u8) -> Result<()> {
-    println!("Using diskpart to prepare the disk for exclusive access...");
-    
-    // Create a temporary script file
-    let script_path = std::env::temp_dir().join("unifortress_diskpart.txt");
-    let script_content = format!("select disk {}\nclean\nexit", disk_number);
-    
-    std::fs::write(&script_path, script_content)
-        .context("Failed to create diskpart script file")?;
-    
-    println!("Running diskpart to clean disk {}. This will erase ALL data!", disk_number);
-    
-    // Run diskpart with the script
-    let output = Command::new("diskpart")
-        .args(&["/s", script_path.to_str().unwrap()])
-        .output()
-        .context("Failed to execute diskpart command")?;
-    
-    // Clean up script file
-    let _ = std::fs::remove_file(script_path);
-    
-    if !output.status.success() {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        println!("Diskpart error: {}", error_msg);
-        bail!("Diskpart failed: {}", error_msg);
-    }
-    
-    let output_text = String::from_utf8_lossy(&output.stdout);
-    println!("Diskpart output:\n{}", output_text);
-    
-    if output_text.contains("DiskPart successfully cleaned the disk") {
-        println!("[OK] Disk successfully cleaned and ready for encryption");
-        Ok(())
-    } else {
-        println!("[WARNING] Diskpart completed but clean confirmation message not found.");
-        println!("Continuing anyway, but operations may fail...");
-        Ok(())
-    }
+        /// Mount point (folder path)
+        #[arg(short, long, name = "mount-point")]
+        mount_point: String,
+    },
+    /// Unmount encrypted USB drive
+    Unmount {
+        /// Mount point (folder path or drive letter)
+        #[arg(short, long, name = "mount-point")]
+        mount_point: String,
+    },
 }
 
 fn main() -> Result<()> {
-    println!("PHYSICAL DEVICE ENCRYPTION TOOL - UNIFORTRESS");
-    println!("================================================================");
+    // Инициализация логирования
+    env_logger::builder()
+        .filter_level(LevelFilter::Info)
+        .init();
     
-    // Check for administrator rights
-    let is_admin = if cfg!(windows) {
-        match Command::new("powershell")
-            .args(&["-Command", "(New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"])
-            .output() {
-                Ok(output) => {
-                    let output_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if output_str == "True" {
-                        println!("[OK] Program is running with administrator rights");
-                        true
-                    } else {
-                        println!("[ERROR] Program is running WITHOUT administrator rights");
-                        println!("This program requires administrator rights to access physical disks.");
-                        println!("Please restart the program with administrator privileges.");
-                        return Ok(());
-                    }
+    // Проверка прав администратора
+    println!("Running with admin privileges: {}", is_admin());
+    
+    // Получение конфигурации из аргументов командной строки
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Commands::Encrypt { device } => {
+            info!("Starting encryption process for device: {}", device);
+
+            // Получаем и выводим информацию о диске
+            match get_disk_details(&device) {
+                Ok((name, size)) => {
+                    println!("Device details:");
+                    println!("  Name: {}", name);
+                    println!("  Size: {}", size);
                 },
                 Err(e) => {
-                    println!("[ERROR] Failed to check administrator rights: {}", e);
-                    println!("Please make sure you're running with administrator privileges.");
-                    return Ok(());
+                    println!("Warning: Could not retrieve full device details: {}", e);
                 }
             }
-    } else {
-        println!("[WARNING] Administrator rights check is not applicable for this OS");
-        true
-    };
-    
-    if !is_admin {
-        bail!("Administrator rights required for disk operations");
-    }
-    
-    // List available disks
-    match list_available_disks() {
-        Ok(disks) => {
-            println!("\nAVAILABLE DISKS:");
-            println!("{}", disks);
-        },
-        Err(e) => {
-            println!("Failed to list disks: {}", e);
-            println!("Continuing without disk list...");
-        }
-    }
-    
-    // Ask for disk number
-    println!("\n[WARNING] Be extremely careful when selecting a disk!");
-    println!("Disk 0 is typically your system disk. DO NOT select it!");
-    println!("Make sure you select the correct removable disk (USB drive) number.");
-    
-    let mut disk_number: u8 = 0;
-    let mut valid_disk = false;
-    
-    while !valid_disk {
-        print!("Enter disk number to encrypt/decrypt (e.g., 1 for Disk 1): ");
-        std::io::stdout().flush()?;
-        
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        
-        match input.trim().parse::<u8>() {
-            Ok(num) => {
-                if num == 0 {
-                    println!("[ERROR] Disk 0 is typically your system disk and cannot be selected.");
-                    println!("Choose another disk number.");
-                } else {
-                    disk_number = num;
-                    valid_disk = true;
-                }
-            },
-            Err(_) => {
-                println!("[ERROR] Invalid disk number. Please enter a valid number.");
-            }
-        }
-    }
-    
-    // Get disk information and confirm
-    println!("\nGetting information about disk {}...", disk_number);
-    
-    match get_disk_info(disk_number) {
-        Ok(info) => {
-            println!("DISK INFORMATION:");
-            println!("{}", info);
-            
-            println!("\n[WARNING] You are about to perform operations on the disk shown above.");
-            println!("[WARNING] ALL DATA ON THIS DISK WILL BE LOST during encryption.");
-            print!("Are you sure you want to continue? (yes/no): ");
-            std::io::stdout().flush()?;
-            
-            let mut confirmation = String::new();
-            std::io::stdin().read_line(&mut confirmation)?;
-            
-            if confirmation.trim().to_lowercase() != "yes" {
-                println!("Operation canceled by user.");
-                return Ok(());
-            }
-        },
-        Err(e) => {
-            println!("Failed to get disk information: {}", e);
-            println!("Do you want to continue without disk information? This is risky!");
-            print!("Continue anyway? (yes/no): ");
-            std::io::stdout().flush()?;
-            
-            let mut confirmation = String::new();
-            std::io::stdin().read_line(&mut confirmation)?;
-            
-            if confirmation.trim().to_lowercase() != "yes" {
-                println!("Operation canceled by user.");
-                return Ok(());
-            }
-        }
-    }
-    
-    // Test direct disk access
-    let use_file_mode = match test_direct_disk_access(disk_number) {
-        Ok(_) => {
-            println!("[OK] Direct disk access test passed");
-            false // Use physical disk
-        },
-        Err(e) => {
-            println!("[WARNING] Direct disk access test failed: {}", e);
-            println!("This might be due to permissions or disk is in use by another process.");
-            println!("Switching to FILE MODE for testing purposes");
-            
-            print!("Do you want to continue in file mode? (yes/no): ");
-            std::io::stdout().flush()?;
-            
-            let mut confirmation = String::new();
-            std::io::stdin().read_line(&mut confirmation)?;
-            
-            if confirmation.trim().to_lowercase() != "yes" {
-                println!("Operation canceled by user.");
-                return Ok(());
-            }
-            
-            true // Use file mode
-        }
-    };
-    
-    // Create path for file mode if needed
-    let file_mode_path = if use_file_mode {
-        let drive_letter = match get_drive_letter_by_disk_number(disk_number) {
-            Ok(letter) => letter,
-            Err(_) => "D".to_string(), // Default to D: if we can't get the letter
-        };
-        
-        let test_file_path = format!("{}:\\test_unifortress.enc", drive_letter);
-        println!("File mode will be used for testing on file: {}", test_file_path);
-        Some(test_file_path)
-    } else {
-        None
-    };
-    
-    // Ask user: encrypt disk or open existing
-    println!("\nSelect operation mode:");
-    println!("1. Encrypt new disk (WILL ERASE ALL DATA)");
-    println!("2. Open existing encrypted disk");
-    print!("Your choice (1 or 2): ");
-    std::io::stdout().flush()?;
-    
-    let mut choice = String::new();
-    std::io::stdin().read_line(&mut choice)?;
-    let choice = choice.trim();
-    
-    let is_new_volume = match choice {
-        "1" => true,
-        "2" => false,
-        _ => {
-            println!("[ERROR] Invalid choice. Operation canceled for safety.");
-            return Ok(());
-        }
-    };
-    
-    // One final confirmation for encrypting a new disk
-    if is_new_volume {
-        println!("\n[WARNING] You are about to ENCRYPT DISK {} which will ERASE ALL DATA on it.", disk_number);
-        print!("Type 'ERASE ALL DATA' to confirm: ");
-        std::io::stdout().flush()?;
-        
-        let mut confirmation = String::new();
-        std::io::stdin().read_line(&mut confirmation)?;
-        
-        if confirmation.trim() != "ERASE ALL DATA" {
-            println!("Confirmation failed. Operation canceled.");
-            return Ok(());
-        }
-    }
 
-    // Open physical device or file - return a Box<dyn Volume> instead of concrete types
-    let mut volume: Box<dyn Volume> = if !use_file_mode {
-        match PhysicalDiskVolume::open(disk_number, SECTOR_SIZE) {
-            Ok(v) => Box::new(v),
-            Err(e) => {
-                println!("[ERROR] Failed to open physical disk: {}", e);
-                println!("Switching to file mode as fallback...");
-                
-                // Create a test file for the encrypted volume
-                let file_path = file_mode_path.unwrap_or_else(|| "D:\\test_unifortress.enc".to_string());
-                
-                // If encrypting a new volume, create a 100MB test file
-                if is_new_volume {
-                    let file_size = 100 * 1024 * 1024; // 100MB
-                    println!("Creating test file: {} ({}MB)", file_path, file_size / 1024 / 1024);
-                    
-                    let file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&file_path)
-                        .with_context(|| format!("Failed to create test file '{}'", file_path))?;
-                    
-                    // Set file size
-                    file.set_len(file_size)
-                        .with_context(|| format!("Failed to set file size for '{}'", file_path))?;
-                    
-                    Box::new(TestFileVolume::new(file, SECTOR_SIZE, disk_number))
-                } else {
-                    // Open existing file
-                    let file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&file_path)
-                        .with_context(|| format!("Failed to open test file '{}'", file_path))?;
-                    
-                    Box::new(TestFileVolume::new(file, SECTOR_SIZE, disk_number))
-                }
+            // ВНИМАНИЕ: Подтверждение, что мы действительно хотим зашифровать устройство
+            println!("WARNING: All data on the device will be DESTROYED!");
+            println!("Device to encrypt: {}", device);
+            print!("Are you SURE you want to continue? (yes/NO): ");
+            std::io::stdout().flush()?;
+
+            let mut response = String::new();
+            std::io::stdin().read_line(&mut response)?;
+            let response = response.trim().to_lowercase();
+
+            if response != "yes" {
+                println!("Encryption cancelled.");
+                return Ok(());
             }
-        }
-    } else {
-        // Use file mode directly
-        let file_path = file_mode_path.unwrap();
-        
-        // If encrypting a new volume, create a 100MB test file
-        if is_new_volume {
-            let file_size = 100 * 1024 * 1024; // 100MB
-            println!("Creating test file: {} ({}MB)", file_path, file_size / 1024 / 1024);
-            
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&file_path)
-                .with_context(|| format!("Failed to create test file '{}'", file_path))?;
-            
-            // Set file size
-            file.set_len(file_size)
-                .with_context(|| format!("Failed to set file size for '{}'", file_path))?;
-            
-            Box::new(TestFileVolume::new(file, SECTOR_SIZE, disk_number))
-        } else {
-            // Open existing file
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&file_path)
-                .with_context(|| format!("Failed to open test file '{}'", file_path))?;
-            
-            Box::new(TestFileVolume::new(file, SECTOR_SIZE, disk_number))
-        }
-    };
-    
-    // Get password depending on mode
-    let password = if is_new_volume {
-        get_password()?
-    } else {
-        verify_password()?
-    };
-    
-    println!("Password accepted. Password length: {} characters", password.len());
-    
-    let volume_size = volume.get_size()?;
-    println!("Disk size: {} bytes ({:.2} GB)", 
-             volume_size, volume_size as f64 / 1024.0 / 1024.0 / 1024.0);
-    println!("Sector size: {} bytes", SECTOR_SIZE);
-    
-    if is_new_volume {
-        // New volume encryption
-        
-        // First use diskpart to prepare the disk (if on Windows)
-        if cfg!(windows) {
-            match prepare_disk_with_diskpart(disk_number) {
-                Ok(_) => println!("[OK] Disk prepared using diskpart"),
+
+            // Проверка доступа к устройству
+            info!("Verifying device accessibility...");
+            match volume_io::open_device(&device) {
+                Ok(_) => info!("Device accessible!"),
                 Err(e) => {
-                    println!("[WARNING] Failed to prepare disk with diskpart: {}", e);
-                    println!("This may cause write operations to fail. Continuing anyway...");
+                    error!("Cannot access device: {}", e);
+                    return Err(anyhow!("Cannot access device: {}", e));
                 }
             }
-        }
-        
-        // Attempt to lock and dismount the volume for exclusive access
-        println!("Preparing disk for encryption...");
-        if let Err(e) = volume.lock_and_dismount() {
-            println!("[WARNING] Failed to prepare disk: {}", e);
-            println!("This may cause write operations to fail if the disk is in use.");
-        }
-        
-        println!("Generating encryption keys...");
-        let salt = generate_salt(SALT_SIZE);
-        println!("Generated random salt with size {} bytes", salt.len());
-        
-        let derived_key = derive_key(password.as_bytes(), &salt)?;
-        let (master_key, hmac_key) = split_derived_key(&derived_key)?;
-        
-        println!("Creating volume header...");
-        let header = VolumeHeader::new(volume_size, SECTOR_SIZE, &master_key, &hmac_key)?;
-        
-        println!("Saving salt in volume header...");
-        let header_serialized = header.serialize()?;
-        
-        println!("Writing header to disk...");
-        let mut header_sector = vec![0u8; SECTOR_SIZE as usize];
-        header_sector[..header_serialized.len()].copy_from_slice(&header_serialized);
-        
-        // Save salt in the last part of header for demonstration
-        let salt_offset = SECTOR_SIZE as usize - SALT_SIZE - 8;
-        header_sector[salt_offset..salt_offset+8].copy_from_slice(b"SALT-ID:");
-        header_sector[salt_offset+8..salt_offset+8+salt.len()].copy_from_slice(&salt);
-        
-        // Try to write to physical disk, do not switch to file mode if it fails
-        match volume.write_sectors(0, SECTOR_SIZE, &header_sector) {
-            Ok(_) => println!("[OK] Header successfully written to disk"),
-            Err(e) => {
-                println!("[ERROR] Failed to write header to disk: {}", e);
-                println!("Please make sure:");
-                println!("1. You have administrator privileges");
-                println!("2. The disk is not being used by another process");
-                println!("3. You have dismounted the volume (using Disk Management)");
-                bail!("Could not write to physical disk");
+
+            // Запрашиваем пароль для шифрования
+            println!("Enter password for encryption (will not be displayed):");
+            let password = rpassword::read_password()?;
+            println!("Confirm password:");
+            let confirm_password = rpassword::read_password()?;
+
+            if password != confirm_password {
+                println!("Passwords do not match. Encryption cancelled.");
+                return Ok(());
             }
-        }
-        
-        // Write a test pattern to the first data sector to verify later
-        println!("Writing verification data...");
-        let test_data = b"This is a UniFortress encrypted volume created on: 2025-04-13";
-        let mut sector_buffer = vec![0u8; SECTOR_SIZE as usize];
-        sector_buffer[..test_data.len()].copy_from_slice(test_data);
-        
-        println!("Encrypting verification data...");
-        encrypt_sector(&mut sector_buffer, HEADER_SECTORS, &master_key)?;
-        
-        println!("Writing encrypted verification data to sector {}...", HEADER_SECTORS);
-        match volume.write_sectors(HEADER_SECTORS, SECTOR_SIZE, &sector_buffer) {
-            Ok(_) => println!("[OK] Verification data successfully written to disk"),
-            Err(e) => {
-                println!("[ERROR] Failed to write verification data: {}", e);
-                println!("The header was written successfully, but verification data failed.");
-                println!("The volume may not be usable. Please try again.");
-                bail!("Failed to complete disk encryption");
+
+            if password.len() < 8 {
+                println!("Password must be at least 8 characters long. Encryption cancelled.");
+                return Ok(());
             }
-        }
+
+            // Начинаем процесс шифрования
+            info!("Starting encryption...");
+            let start = Instant::now();
+            encrypt_device(&device, &password)?;
+            let duration = start.elapsed();
+
+            info!("Encryption completed successfully in {:.2?}!", duration);
+            println!("Device {} has been encrypted.", device);
+            println!("Please keep your password safe. If you lose it, all data will be unrecoverable!");
+
+            Ok(())
+        },
+        Commands::FastEncrypt { device } => {
+            info!("Starting FAST encryption process for device: {}", device);
+
+            // Получаем и выводим информацию о диске
+            match get_disk_details(&device) {
+                Ok((name, size)) => {
+                    println!("Device details:");
+                    println!("  Name: {}", name);
+                    println!("  Size: {}", size);
+                },
+                Err(e) => {
+                    println!("Warning: Could not retrieve full device details: {}", e);
+                }
+            }
+
+            // ВНИМАНИЕ: Подтверждение, что мы действительно хотим зашифровать устройство
+            println!("WARNING: All data on the device will be DESTROYED!");
+            println!("Device to encrypt: {}", device);
+            print!("Are you SURE you want to continue? (yes/NO): ");
+            std::io::stdout().flush()?;
+
+            let mut response = String::new();
+            std::io::stdin().read_line(&mut response)?;
+            let response = response.trim().to_lowercase();
+
+            if response != "yes" {
+                println!("Encryption cancelled.");
+                return Ok(());
+            }
+
+            // Проверка доступа к устройству
+            info!("Verifying device accessibility...");
+            match volume_io::open_device(&device) {
+                Ok(_) => info!("Device accessible!"),
+                Err(e) => {
+                    error!("Cannot access device: {}", e);
+                    return Err(anyhow!("Cannot access device: {}", e));
+                }
+            }
+
+            // Запрашиваем пароль для шифрования
+            println!("Enter password for encryption (will not be displayed):");
+            let password = rpassword::read_password()?;
+            println!("Confirm password:");
+            let confirm_password = rpassword::read_password()?;
+
+            if password != confirm_password {
+                println!("Passwords do not match. Encryption cancelled.");
+                return Ok(());
+            }
+
+            if password.len() < 8 {
+                println!("Password must be at least 8 characters long. Encryption cancelled.");
+                return Ok(());
+            }
+
+            // Начинаем процесс быстрого шифрования
+            info!("Starting fast encryption (deferred encryption)...");
+            let start = Instant::now();
+            fast_encrypt_device(&device, &password)?;
+            let duration = start.elapsed();
+
+            info!("Fast encryption completed successfully in {:.2?}!", duration);
+            println!("Device {} has been prepared for encryption.", device);
+            println!("Note: Only the header has been encrypted. Data will be encrypted on-the-fly when written.");
+            println!("Please keep your password safe. If you lose it, all data will be unrecoverable!");
+
+            Ok(())
+        },
+        Commands::Check { device } => {
+            info!("Checking if device is encrypted: {}", device);
+
+            match decryption::is_encrypted_volume(&device) {
+                Ok(true) => {
+                    println!("Device is encrypted with UniFortress.");
+                    Ok(())
+                }
+                Ok(false) => {
+                    println!("Device is NOT encrypted with UniFortress.");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Error checking device: {}", e);
+                    Err(anyhow!("Error checking device: {}", e))
+                }
+            }
+        },
+        Commands::List => {
+            info!("Listing available drives");
+            if let Err(e) = list_drives() {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            Ok(())
+        },
+        Commands::Mount { device, mount_point } => {
+            info!("Mounting encrypted device: {} at {}", device, mount_point);
+            
+            // Запрашиваем пароль из консоли
+            println!("Enter password for decryption:");
+            let password = rpassword::read_password()?;
+            
+            match mount::windows::mount_encrypted_disk(&device, &password, &mount_point) {
+                Ok(_) => {
+                    println!("Device successfully mounted at {}:", mount_point);
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to mount device: {}", e);
+                    Err(anyhow!("Failed to mount device: {}", e))
+                }
+            }
+        },
+        Commands::Unmount { mount_point } => {
+            info!("Unmounting encrypted device from {}", mount_point);
+            
+            match mount::windows::unmount_encrypted_disk(&mount_point) {
+                Ok(_) => {
+                    println!("Device successfully unmounted from {}:", mount_point);
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to unmount device: {}", e);
+                    Err(anyhow!("Failed to unmount device: {}", e))
+                }
+            }
+        },
+    }
+}
+
+// Function to list all available drives
+fn list_drives() -> Result<()> {
+    println!("Available drives:");
+    
+    if cfg!(windows) {
+        // For Windows, use diskpart to get all disks (similar to the example)
+        // Create a temporary script file for diskpart
+        let diskpart_script = "list disk\nexit\n";
+        let script_path = std::env::temp_dir().join("unifortress_diskpart.txt");
+        std::fs::write(&script_path, diskpart_script)?;
         
-        println!("\n[SUCCESS] Disk encrypted successfully!");
-        println!("Password and salt have been used to generate encryption keys.");
-        println!("The disk can now be mounted with the same password.");
+        // Execute diskpart with the script
+        let output = Command::new("diskpart")
+            .args(["/s", script_path.to_str().unwrap()])
+            .output()?;
         
-        // После успешного шифрования устанавливаем файлы автозапуска
-        if setup_autorun_on_disk(disk_number)?.is_empty() {
-            println!("Warning: Disk encrypted successfully, but autorun setup failed.");
-            println!("For manual mounting, use the command:");
-            println!("  unifortress unlock -f <path_to_encrypted_file>");
-        }
+        let output_str = String::from_utf8_lossy(&output.stdout);
         
-    } else {
-        // Open existing volume
-        println!("Reading encrypted volume header...");
-        let mut header_sector = vec![0u8; SECTOR_SIZE as usize];
-        volume.read_sectors(0, 1, SECTOR_SIZE, &mut header_sector)?;
-        
-        // Extract salt from header
-        let salt_offset = SECTOR_SIZE as usize - SALT_SIZE - 8;
-        let salt_tag = &header_sector[salt_offset..salt_offset+8];
-        
-        if salt_tag != b"SALT-ID:" {
-            bail!("Disk is not a UniFortress encrypted volume or is corrupted!");
-        }
-        
-        let salt = &header_sector[salt_offset+8..salt_offset+8+SALT_SIZE];
-        println!("Found salt in volume header");
-        
-        // Generate keys from password and salt
-        println!("Restoring encryption keys from password...");
-        let derived_key = derive_key(password.as_bytes(), salt)?;
-        #[allow(unused_variables)]
-        let (master_key, hmac_key) = split_derived_key(&derived_key)?;
-        
-        // Read verification sector
-        println!("Checking data access...");
-        let mut test_sector = vec![0u8; SECTOR_SIZE as usize];
-        volume.read_sectors(HEADER_SECTORS, 1, SECTOR_SIZE, &mut test_sector)?;
-        
-        // Decrypt verification sector
-        println!("Decrypting verification data...");
-        decrypt_sector(&mut test_sector, HEADER_SECTORS, &master_key)?;
-        
-        // Check for expected data in decrypted sector
-        let text_prefix = b"This is a UniFortress";
-        if test_sector.starts_with(text_prefix) {
-            println!("\n[SUCCESS] Volume access granted!");
-            println!("Verification data: \"{}\"", 
-                     String::from_utf8_lossy(&test_sector[..60]).trim_end_matches('\0'));
-            println!("You can now mount this encrypted volume.");
+        // Extract and print only the disk list part
+        if let Some(start_idx) = output_str.find("DISKPART>") {
+            if let Some(disk_list_start) = output_str[start_idx..].find("Disk ###") {
+                let disk_list = &output_str[start_idx + disk_list_start..];
+                println!("{}", disk_list);
+            }
         } else {
-            println!("\n[ERROR] Access error! Incorrect password or corrupted volume.");
-            bail!("Failed to decrypt data with the given password");
+            // If parsing fails, print the entire output
+            println!("{}", output_str);
         }
+        
+        // Clean up the temporary script
+        let _ = std::fs::remove_file(script_path);
+        
+        // Show clear usage examples
+        println!("\nUsage examples:");
+        println!("  To encrypt system disk (usually disk 0): unifortress encrypt --device \\\\.\\PhysicalDrive0");
+        println!("  To encrypt removable disk: unifortress encrypt --device \\\\.\\PhysicalDrive1");
+        println!("");
+        println!("WARNING: BE EXTREMELY CAREFUL when selecting a system disk! This will DESTROY ALL DATA!");
+    } else {
+        // For Unix-like systems, use lsblk with better formatting
+        let output = Command::new("lsblk")
+            .args(["-o", "NAME,SIZE,TYPE,MOUNTPOINT,MODEL", "--noheadings"])
+            .output()?;
+        
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        println!("{}", output_str);
+        
+        println!("Usage example:");
+        println!("  To encrypt a USB drive: unifortress encrypt --device /dev/sdb");
     }
     
-    println!("\nOperation completed successfully!");
+    // Additional safeguard message
+    println!("\nIMPORTANT: Before encrypting, make sure you have selected the correct device!");
+    println!("           ALL DATA on the selected device WILL BE DESTROYED!");
     
     Ok(())
 }
 
-// Add file creation functions for autorun setup
-fn setup_autorun_on_disk(disk_number: u8) -> Result<String> {
-    // Determine drive letter by disk number
-    let drive_letter = get_drive_letter_by_disk_number(disk_number)?;
-    
-    // Path to disk
-    let drive_path = format!("{}:\\", drive_letter);
-    
-    // Create directories for autorun
-    let autorun_dir = format!("{}unifortress", drive_path);
-    std::fs::create_dir_all(&autorun_dir)?;
-    
-    // Copy binaries
-    // 1. Get path to current executable
-    let current_exe = std::env::current_exe()?;
-    let current_exe_dir = current_exe.parent().unwrap_or(Path::new(""));
-    
-    // 2. Path to main binary and launcher
-    let unifortress_src = current_exe_dir.join("unifortress.exe");
-    let launcher_src = current_exe_dir.join("unifortress_launcher.exe");
-    
-    // 3. Destination paths
-    let unifortress_dst = format!("{}\\unifortress\\unifortress.exe", drive_path);
-    let launcher_dst = format!("{}\\unifortress\\launcher.exe", drive_path);
-    
-    // 4. Copy main binary if it exists
-    if unifortress_src.exists() {
-        std::fs::copy(&unifortress_src, &unifortress_dst)?;
-        println!("Copied file {}", unifortress_dst);
+// Function to get disk details
+fn get_disk_details(device_path: &str) -> Result<(String, String)> {
+    if cfg!(windows) {
+        // Extract disk number from path
+        let disk_number = if device_path.starts_with(r"\\.\PhysicalDrive") {
+            device_path.trim_start_matches(r"\\.\PhysicalDrive")
+        } else {
+            return Err(anyhow!("Invalid device path format"));
+        };
+        
+        // Create a temporary script file for diskpart
+        let diskpart_script = format!("select disk {}\ndetail disk\nexit\n", disk_number);
+        let script_path = std::env::temp_dir().join("unifortress_diskpart_detail.txt");
+        std::fs::write(&script_path, diskpart_script)?;
+        
+        // Execute diskpart with the script
+        let output = Command::new("diskpart")
+            .args(["/s", script_path.to_str().unwrap()])
+            .output()?;
+        
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        
+        // Clean up the temporary script
+        let _ = std::fs::remove_file(script_path);
+        
+        // Extract disk model/name
+        let friendly_name = match output_str
+            .lines()
+            .find(|line| line.contains("Model") || line.contains("Disk ID"))
+        {
+            Some(line) => {
+                let parts: Vec<&str> = line.split(":").collect();
+                if parts.len() >= 2 {
+                    parts[1].trim().to_string()
+                } else {
+                    "Unknown Disk".to_string()
+                }
+            },
+            None => "Unknown Disk".to_string()
+        };
+        
+        // Extract disk size
+        let size_str = match output_str
+            .lines()
+            .find(|line| line.contains("Size:") || line.contains("GB"))
+        {
+            Some(line) => {
+                let parts: Vec<&str> = line.split(":").collect();
+                if parts.len() >= 2 {
+                    parts[1].trim().to_string()
+                } else {
+                    // If the line doesn't have a colon, use the whole line
+                    line.trim().to_string()
+                }
+            },
+            None => {
+                // Fallback: get size from the main output of diskpart
+                match output_str
+                    .lines()
+                    .find(|line| line.contains("GB") && line.contains("Disk"))
+                {
+                    Some(line) => {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        match parts.iter().find(|part| part.contains("GB")) {
+                            Some(size_part) => size_part.to_string(),
+                            None => "Unknown Size".to_string()
+                        }
+                    },
+                    None => "Unknown Size".to_string()
+                }
+            }
+        };
+        
+        Ok((friendly_name, size_str))
     } else {
-        println!("Warning: unifortress.exe not found. Skipping copy.");
+        // For Unix-like systems, use a simpler approach
+        let device_name = device_path.split('/').last().unwrap_or("unknown").to_string();
+        
+        // Get disk size using lsblk
+        let output = Command::new("lsblk")
+            .args(["-bdno", "SIZE", device_path])
+            .output()?;
+        
+        let size_bytes = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0);
+        
+        let size_gb = size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let size_str = format!("{:.2} GB", size_gb);
+        
+        Ok((device_name, size_str))
     }
-    
-    // 5. Copy launcher if it exists
-    if launcher_src.exists() {
-        std::fs::copy(&launcher_src, &launcher_dst)?;
-        println!("Copied file {}", launcher_dst);
-    } else {
-        println!("Warning: unifortress_launcher.exe not found. Skipping copy.");
-    }
-    
-    // Create autorun.inf in disk root
-    let autorun_path = format!("{}autorun.inf", drive_path);
-    let mut autorun_file = File::create(&autorun_path)?;
-    
-    // Content of autorun.inf
-    let autorun_content = format!(r#"[AutoRun]
-open=unifortress\launcher.exe
-icon=unifortress\launcher.exe,0
-label=UniFortress Encrypted Drive
-action=Open UniFortress Encrypted Drive
-"#);
-    
-    autorun_file.write_all(autorun_content.as_bytes())?;
-    println!("Created file {}", autorun_path);
-    
-    // Create README file on disk
-    let readme_path = format!("{}README.txt", drive_path);
-    let mut readme_file = File::create(&readme_path)?;
-    
-    let readme_content = r#"=== UniFortress Encrypted Drive ===
-
-This disk is protected by UniFortress encryption.
-
-To access encrypted data:
-1. When connecting the disk, the UniFortress application will automatically start
-2. Enter the password you specified when encrypting the disk
-3. After successful password verification, the encrypted disk will be mounted as drive V:
-
-Note: If autorun doesn't work, manually run the unifortress\launcher.exe program.
-
-=== Technical Information ===
-- Uses AES-256 encryption in XTS mode
-- Encryption key is derived from password using Argon2
-- Random salt is used to protect against password brute force attacks
-"#;
-    
-    readme_file.write_all(readme_content.as_bytes())?;
-    println!("Created file {}", readme_path);
-    
-    Ok(drive_letter)
 }
 
-// Helper function to get drive letter by disk number
-fn get_drive_letter_by_disk_number(disk_number: u8) -> Result<String> {
-    // Request information through PowerShell
-    let cmd = format!(
-        "Get-Partition -DiskNumber {} | Select-Object -ExpandProperty DriveLetter", 
-        disk_number
-    );
-    
-    let output = Command::new("powershell")
-        .args(&[
-            "-Command",
-            &cmd
-        ])
-        .output()
-        .context("Failed to execute PowerShell command to get drive letter")?;
+// Check if running with administrator privileges
+fn is_admin() -> bool {
+    if cfg!(windows) {
+        // On Windows, check for admin rights
+        match Command::new("net")
+            .args(["session"])
+            .output() {
+            Ok(output) => output.status.success(),
+            Err(_) => false,
+        }
+    } else if cfg!(unix) {
+        // On Unix, check if running as root
+        match Command::new("id")
+            .args(["-u"])
+            .output() {
+            Ok(output) => {
+                if let Ok(stdout) = String::from_utf8(output.stdout) {
+                    stdout.trim() == "0"
+                } else {
+                    false
+                }
+            },
+            Err(_) => false,
+        }
+    } else {
+        // On other platforms, assume not admin
+        false
+    }
+}
 
-    if !output.status.success() {
-        bail!("Command execution error: {}", String::from_utf8_lossy(&output.stderr));
+// Derive encryption key from password and salt
+fn derive_key(password: &str, salt: &[u8]) -> Result<Vec<u8>> {
+    // Create a key derivation function (simplified for the example)
+    // In a real implementation, should use a proper KDF like PBKDF2 or Argon2
+    let mut key = vec![0u8; KEY_SIZE];
+    
+    // Simple KDF for demonstration
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    hasher.update(salt);
+    let hash = hasher.finalize();
+    
+    // First half of the key
+    let mut hasher = Sha256::new();
+    hasher.update(&hash);
+    hasher.update(b"1");
+    let hash1 = hasher.finalize();
+    
+    // Second half of the key
+    let mut hasher = Sha256::new();
+    hasher.update(&hash);
+    hasher.update(b"2");
+    let hash2 = hasher.finalize();
+    
+    // Combine the two hashes
+    key[0..32].copy_from_slice(&hash1);
+    key[32..64].copy_from_slice(&hash2);
+    
+    Ok(key)
+}
+
+// Initialize XTS cipher with the given key
+fn init_cipher(key: &[u8]) -> Result<Xts<Aes256>> {
+    if key.len() != KEY_SIZE {
+        return Err(anyhow!("Invalid key size, expected {} bytes", KEY_SIZE));
+    }
+    
+    // Split the key into two parts for XTS
+    let key1 = &key[0..32];
+    let key2 = &key[32..64];
+    
+    // Create AES-256 instances
+    let cipher1 = Aes256::new_from_slice(key1)
+        .map_err(|e| anyhow!("Failed to create first AES cipher: {}", e))?;
+    let cipher2 = Aes256::new_from_slice(key2)
+        .map_err(|e| anyhow!("Failed to create second AES cipher: {}", e))?;
+    
+    // Create XTS cipher
+    let cipher = Xts::new(cipher1, cipher2);
+    
+    Ok(cipher)
+}
+
+// Encrypt buffer using XTS mode
+fn encrypt_buffer(cipher: &Xts<Aes256>, buffer: &mut [u8], sector: u64) -> Result<()> {
+    // Check buffer length
+    if buffer.len() % 16 != 0 {
+        return Err(anyhow!("Buffer length must be a multiple of 16 bytes"));
+    }
+    
+    // Encrypt each sector (512 bytes)
+    for (i, chunk) in buffer.chunks_mut(SECTOR_SIZE).enumerate() {
+        // Convert sector number to tweak bytes (16 byte array)
+        let sector_num = sector as u128 + i as u128;
+        let mut tweak = [0u8; 16];
+        
+        // Convert u128 to byte array (little endian)
+        tweak[0..8].copy_from_slice(&(sector_num as u64).to_le_bytes());
+        tweak[8..16].copy_from_slice(&((sector_num >> 64) as u64).to_le_bytes());
+        
+        cipher.encrypt_sector(chunk, tweak);
+    }
+    
+    Ok(())
+}
+
+// Функция для монтирования зашифрованного устройства
+fn mount_device(device_path: &str, password: &str, mount_point: &str) -> Result<()> {
+    // Проверка прав администратора
+    if !is_admin() {
+        return Err(anyhow!("This operation requires administrator privileges"));
     }
 
-    let drive_letter = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    println!("Mounting device: {}", device_path);
+    let device_path = get_device_path(device_path)?;
     
-    if drive_letter.is_empty() {
-        bail!("Failed to get drive letter for disk {}", disk_number);
+    // Проверяем, что устройство действительно зашифровано
+    if !is_encrypted_volume(&device_path)? {
+        return Err(anyhow!("The device is not encrypted with UniFortress"));
     }
     
-    Ok(drive_letter)
+    // Проверяем пароль
+    if !verify_password(&device_path, password)? {
+        return Err(anyhow!("Authentication failed: incorrect password"));
+    }
+    
+    // Монтируем устройство
+    println!("Mounting to: {}", mount_point);
+    mount::mount(&device_path, password, mount_point)?;
+    
+    println!("Device successfully mounted!");
+    
+    Ok(())
+}
+
+// Функция для проверки, зашифровано ли устройство с помощью UniFortress
+fn is_encrypted_volume(device_path: &str) -> Result<bool> {
+    // Открываем устройство только для чтения
+    let mut device = open_device_for_reading(device_path)?;
+    
+    // Читаем заголовок
+    let mut header = vec![0u8; HEADER_SIZE];
+    if let Err(e) = device.seek(SeekFrom::Start(0)).and_then(|_| device.read_exact(&mut header)) {
+        return Err(anyhow!("Failed to read device header: {}", e));
+    }
+    
+    // Проверяем сигнатуру
+    Ok(&header[0..7] == b"UNIFORT")
+}
+
+// Функция для проверки пароля без вывода сообщений
+fn verify_password(device_path: &str, password: &str) -> Result<bool> {
+    // Открываем устройство только для чтения
+    let mut device = open_device_for_reading(device_path)?;
+    
+    // Читаем заголовок
+    let mut header = vec![0u8; HEADER_SIZE];
+    if let Err(e) = device.seek(SeekFrom::Start(0)).and_then(|_| device.read_exact(&mut header)) {
+        return Err(anyhow!("Failed to read device header: {}", e));
+    }
+    
+    // Проверяем сигнатуру
+    if &header[0..7] != b"UNIFORT" {
+        return Err(anyhow!("Device is not encrypted with UniFortress"));
+    }
+    
+    // Получаем соль
+    if 16 + SALT_SIZE > header.len() {
+        return Err(anyhow!("Invalid header format: salt section missing"));
+    }
+    let salt = &header[16..16+SALT_SIZE];
+    
+    // Генерируем ключ
+    let key = derive_key(password, salt)?;
+    
+    // Проверяем контрольную сумму
+    let mut hasher = Sha256::new();
+    hasher.update(&key);
+    let checksum = hasher.finalize();
+    
+    if 48 + 32 > header.len() {
+        return Err(anyhow!("Invalid header format: checksum section missing"));
+    }
+    
+    Ok(&header[48..48+32] == checksum.as_slice())
+}
+
+// Open device for reading
+fn open_device_for_reading(path: &str) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .context("Failed to open device for reading")
+}
+
+// Open device for writing
+fn open_device_for_writing(path: &str) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .context("Failed to open device for writing")
+}
+
+// Get full device path
+fn get_device_path(device: &str) -> Result<String> {
+    if cfg!(windows) {
+        // For Windows: if a drive letter is specified, convert to physical device path
+        if device.len() == 1 && device.chars().next().unwrap().is_alphabetic() {
+            return Ok(format!(r"\\.\{}:", device));
+        } else if device.len() == 2 && device.ends_with(":") {
+            return Ok(format!(r"\\.\{}", device));
+        }
+    }
+    
+    // Otherwise return as is
+    Ok(device.to_string())
+}
+
+// Function to encrypt the device
+fn encrypt_device(device_path: &str, password: &str) -> anyhow::Result<()> {
+    // Проверка прав администратора
+    #[cfg(target_os = "windows")]
+    if !is_admin() {
+        anyhow::bail!("This command requires administrator privileges!");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if !is_admin() {
+        anyhow::bail!("This command requires root privileges!");
+    }
+    
+    // Вызов функции шифрования из модуля encryption
+    unifortress::encryption::encrypt_volume(device_path, &password)?;
+    
+    println!("Device encrypted successfully!");
+    println!("To mount this device, use: unifortress mount {}", device_path);
+    
+    Ok(())
+}
+
+/// Выполняет быстрое шифрование устройства с использованием отложенного шифрования
+/// 
+/// # Arguments
+/// * `device_path` - Путь к устройству
+/// * `password` - Пароль для шифрования
+/// 
+/// # Returns
+/// Результат операции
+fn fast_encrypt_device(device_path: &str, password: &str) -> Result<()> {
+    // Преобразуем путь к устройству в полный путь, если это необходимо
+    let device_path = get_device_path(device_path)?;
+    
+    // Создаем новый том с отложенным шифрованием
+    info!("Creating new deferred encrypted volume at {}", device_path);
+    let mut volume = DeferredEncryptedVolume::new(&device_path, password)?;
+    
+    // Выполняем быстрое шифрование (только заголовок)
+    info!("Performing fast encryption (headers only)...");
+    volume.fast_encrypt()?;
+    
+    info!("Fast encryption completed successfully");
+    
+    Ok(())
+}
+
+fn run_command(cli: &Cli) -> anyhow::Result<()> {
+    match &cli.command {
+        Commands::Encrypt { device } => {
+            encrypt_device(device, &prompt_for_password()?)?;
+            println!("Encryption completed successfully.");
+        },
+        Commands::FastEncrypt { device } => {
+            fast_encrypt_device(device, &prompt_for_password()?)?;
+            println!("Fast encryption completed successfully.");
+        },
+        Commands::Check { device } => {
+            match decryption::is_encrypted_volume(device) {
+                Ok(true) => {
+                    println!("Device is encrypted with UniFortress.");
+                    
+                    // Запрашиваем пароль для проверки
+                    match decryption::verify_password(device, &prompt_for_password()?) {
+                        Ok(true) => println!("Password is correct."),
+                        Ok(false) => println!("Password is incorrect."),
+                        Err(e) => eprintln!("Error verifying password: {}", e),
+                    }
+                }
+                Ok(false) => println!("Device is not encrypted."),
+                Err(e) => eprintln!("Error checking device: {}", e),
+            }
+        },
+        Commands::List => {
+            list_drives()?;
+        },
+        Commands::Mount { device, mount_point } => {
+            mount::windows::mount_encrypted_disk(device, &prompt_for_password()?, mount_point)?;
+            println!("Device mounted successfully at {}", mount_point);
+        },
+        Commands::Unmount { mount_point } => {
+            mount::windows::unmount_encrypted_disk(mount_point)?;
+            println!("Device unmounted successfully from {}", mount_point);
+        },
+    }
+    Ok(())
+}
+
+fn prompt_for_password() -> Result<String> {
+    println!("Enter password:");
+    let password = rpassword::read_password()
+        .context("Failed to read password")?;
+    
+    // Добавляем проверку минимальной длины пароля
+    if password.len() < 8 {
+        bail!("Password must be at least 8 characters long");
+    }
+    
+    Ok(password)
 } 

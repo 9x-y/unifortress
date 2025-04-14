@@ -11,6 +11,14 @@ hmac = "0.12"
 sha2 = "0.10"
 argon2 = "0.5"
 rand = "0.8"
+rand_core = "0.6"
+chacha20poly1305 = "0.10.1"
+
+# Параллельная обработка и асинхронность
+rayon = "1.8"
+tokio = { version = "1.32", features = ["full"] }
+futures = "0.3"
+num_cpus = "1.15"
 
 # Обработка ошибок
 anyhow = "1.0"
@@ -34,4 +42,17 @@ uuid = { version = "1.7", features = ["v4"] }
 # Для монтирования виртуального диска в Windows
 dokan = "0.2" # Используем dokan вместо dokan-rust
 dokan-sys = "0.2" # Добавляем зависимость на dokan-sys
-winapi = { version = "0.3.9", features = ["winioctl", "ioapiset", "minwinbase", "minwindef"] }
+winapi = { version = "0.3.9", features = ["winioctl", "ioapiset", "minwinbase", "minwindef", "processthreadsapi", "winbase"] }
+
+# Добавленные зависимости для работы с Windows
+lazy_static = "1.4"
+widestring = "1.2.0"
+crossbeam-channel = "0.5.15"
+
+[[bin]]
+name = "unifortress"
+path = "src/bin/disk_encrypt.rs"
+
+[[bin]]
+name = "launcher"
+path = "src/bin/launcher.rs"

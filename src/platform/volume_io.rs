@@ -1,10 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Result, anyhow};
 use log::{debug, trace};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
 
 /// Определяем виртуальный размер сектора для работы внутри файла-контейнера.
 /// 4096 байт - частый размер сектора для современных дисков и ФС.
@@ -221,18 +219,33 @@ impl VolumeFile {
         sector_size: u32, // Принимаем для совместимости, но проверяем с VIRTUAL_SECTOR_SIZE
         buffer: &mut [u8],
     ) -> Result<()> {
-        if sector_size != VIRTUAL_SECTOR_SIZE {
-             bail!("Несоответствие размера сектора: ожидался {}, получен {}", VIRTUAL_SECTOR_SIZE, sector_size);
-        }
-        let expected_buffer_size = (num_sectors * VIRTUAL_SECTOR_SIZE) as usize;
+        // Если это физическое устройство, используем реальный размер сектора
+        let actual_sector_size = if self.is_physical {
+            match self.real_sector_size {
+                Some(size) => size,
+                None => {
+                    // Если real_sector_size не установлен, но это физическое устройство,
+                    // используем предоставленный размер сектора
+                    sector_size
+                }
+            }
+        } else {
+            // Для файлов-контейнеров проверяем соответствие виртуальному размеру сектора
+            if sector_size != VIRTUAL_SECTOR_SIZE {
+                bail!("Sector size mismatch: expected {}, got {}", VIRTUAL_SECTOR_SIZE, sector_size);
+            }
+            VIRTUAL_SECTOR_SIZE
+        };
+
+        let expected_buffer_size = (num_sectors * actual_sector_size) as usize;
         if buffer.len() != expected_buffer_size {
             bail!(
-                "Неверный размер буфера для read_sectors. Ожидался {}, получен {}",
+                "Invalid buffer size for read_sectors. Expected {}, got {}",
                 expected_buffer_size,
                 buffer.len()
             );
         }
-        let offset = start_sector * VIRTUAL_SECTOR_SIZE as u64;
+        let offset = start_sector * actual_sector_size as u64;
         self.read_at(offset, buffer)
     }
 
@@ -243,19 +256,234 @@ impl VolumeFile {
         sector_size: u32, // Принимаем для совместимости
         buffer: &[u8],
     ) -> Result<()> {
-         if sector_size != VIRTUAL_SECTOR_SIZE {
-             bail!("Несоответствие размера сектора: ожидался {}, получен {}", VIRTUAL_SECTOR_SIZE, sector_size);
-        }
-        if buffer.is_empty() || buffer.len() % VIRTUAL_SECTOR_SIZE as usize != 0 {
+        // Если это физическое устройство, используем реальный размер сектора
+        let actual_sector_size = if self.is_physical {
+            match self.real_sector_size {
+                Some(size) => size,
+                None => {
+                    // Если real_sector_size не установлен, но это физическое устройство,
+                    // используем предоставленный размер сектора
+                    sector_size
+                }
+            }
+        } else {
+            // Для файлов-контейнеров проверяем соответствие виртуальному размеру сектора
+            if sector_size != VIRTUAL_SECTOR_SIZE {
+                bail!("Sector size mismatch: expected {}, got {}", VIRTUAL_SECTOR_SIZE, sector_size);
+            }
+            VIRTUAL_SECTOR_SIZE
+        };
+
+        if buffer.is_empty() || buffer.len() % actual_sector_size as usize != 0 {
             bail!(
-                "Неверный размер буфера для write_sectors. Размер {} не кратен размеру сектора {}",
+                "Invalid buffer size for write_sectors. Size {} is not a multiple of sector size {}",
                 buffer.len(),
-                VIRTUAL_SECTOR_SIZE
+                actual_sector_size
             );
         }
-        let offset = start_sector * VIRTUAL_SECTOR_SIZE as u64;
+        let offset = start_sector * actual_sector_size as u64;
         self.write_at(offset, buffer)
     }
+
+    // Адаптер для простого открытия по пути (для совместимости)
+    pub fn open_path(path: &Path) -> Result<Self> {
+        // Преобразуем Path в строку
+        let path_str = path.to_str().ok_or_else(|| anyhow!("Invalid path"))?;
+        Self::open(path_str, false)
+    }
+}
+
+/// Открывает устройство для чтения и записи
+pub fn open_device(device_path: &str) -> Result<VolumeFile> {
+    if cfg!(target_os = "windows") {
+        open_windows_device(device_path)
+    } else if cfg!(any(target_os = "linux", target_os = "macos")) {
+        open_unix_device(device_path)
+    } else {
+        Err(anyhow!("Unsupported platform"))
+    }
+}
+
+/// Открывает устройство только для чтения
+pub fn open_device_readonly(device_path: &str) -> Result<VolumeFile> {
+    if cfg!(target_os = "windows") {
+        open_windows_device_readonly(device_path)
+    } else if cfg!(any(target_os = "linux", target_os = "macos")) {
+        open_unix_device_readonly(device_path)
+    } else {
+        Err(anyhow!("Unsupported platform"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_device(device_path: &str) -> Result<VolumeFile> {
+    
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use winapi::um::winioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY};
+    use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
+    use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::ioapiset::DeviceIoControl;
+    use std::path::PathBuf;
+    
+    // Преобразуем путь к устройству в широкую строку
+    let wide_path = std::os::windows::ffi::OsStrExt::encode_wide(
+        std::ffi::OsStr::new(device_path)
+    ).chain(Some(0)).collect::<Vec<_>>();
+    
+    // Открываем устройство
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(anyhow!("Failed to open device: {}", std::io::Error::last_os_error()));
+    }
+    
+    // Получаем размер сектора с помощью DeviceIoControl
+    let mut disk_geometry: DISK_GEOMETRY = unsafe { std::mem::zeroed() };
+    
+    let mut bytes_returned: u32 = 0;
+    
+    let ioctl_result = unsafe {
+        DeviceIoControl(
+            handle as *mut _,
+            IOCTL_DISK_GET_DRIVE_GEOMETRY,
+            std::ptr::null_mut(),
+            0,
+            &mut disk_geometry as *mut _ as *mut _,
+            std::mem::size_of::<DISK_GEOMETRY>() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    
+    let bytes_per_sector = if ioctl_result != 0 {
+        // DeviceIoControl успешно завершился
+        disk_geometry.BytesPerSector
+    } else {
+        // В случае ошибки используем стандартный размер сектора
+        debug!("Failed to get sector size, using default: {}", std::io::Error::last_os_error());
+        512 // Стандартный размер сектора для большинства устройств
+    };
+    
+    debug!("Device sector size: {} bytes", bytes_per_sector);
+    
+    // Создаем File из handle
+    let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
+    
+    // Создаем и возвращаем VolumeFile с реальным размером сектора
+    Ok(VolumeFile {
+        file,
+        path: PathBuf::from(device_path),
+        is_physical: true,
+        real_sector_size: Some(bytes_per_sector),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_device_readonly(device_path: &str) -> Result<VolumeFile> {
+    
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use winapi::um::winioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY};
+    use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
+    use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ};
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::ioapiset::DeviceIoControl;
+    use std::path::PathBuf;
+    
+    // Преобразуем путь к устройству в широкую строку
+    let wide_path = std::os::windows::ffi::OsStrExt::encode_wide(
+        std::ffi::OsStr::new(device_path)
+    ).chain(Some(0)).collect::<Vec<_>>();
+    
+    // Открываем устройство только для чтения
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(anyhow!("Failed to open device: {}", std::io::Error::last_os_error()));
+    }
+    
+    // Получаем размер сектора с помощью DeviceIoControl
+    let mut disk_geometry: DISK_GEOMETRY = unsafe { std::mem::zeroed() };
+    
+    let mut bytes_returned: u32 = 0;
+    
+    let ioctl_result = unsafe {
+        DeviceIoControl(
+            handle as *mut _,
+            IOCTL_DISK_GET_DRIVE_GEOMETRY,
+            std::ptr::null_mut(),
+            0,
+            &mut disk_geometry as *mut _ as *mut _,
+            std::mem::size_of::<DISK_GEOMETRY>() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    
+    let bytes_per_sector = if ioctl_result != 0 {
+        // DeviceIoControl успешно завершился
+        disk_geometry.BytesPerSector
+    } else {
+        // В случае ошибки используем стандартный размер сектора
+        debug!("Failed to get sector size, using default: {}", std::io::Error::last_os_error());
+        512 // Стандартный размер сектора для большинства устройств
+    };
+    
+    debug!("Device sector size: {} bytes", bytes_per_sector);
+    
+    // Создаем File из handle
+    let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
+    
+    // Создаем и возвращаем VolumeFile с реальным размером сектора
+    Ok(VolumeFile {
+        file,
+        path: PathBuf::from(device_path),
+        is_physical: true,
+        real_sector_size: Some(bytes_per_sector),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_unix_device(device_path: &str) -> Result<VolumeFile> {
+    // Implementation will be added later
+    Err(anyhow!("Not implemented yet"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_unix_device_readonly(device_path: &str) -> Result<VolumeFile> {
+    // Implementation will be added later
+    Err(anyhow!("Not implemented yet"))
+}
+
+// Добавляем заглушки для Unix-функций, чтобы компиляция не ломалась на Windows
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_unix_device(device_path: &str) -> Result<VolumeFile> {
+    Err(anyhow!("Unix-specific function called on non-Unix platform"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_unix_device_readonly(device_path: &str) -> Result<VolumeFile> {
+    Err(anyhow!("Unix-specific function called on non-Unix platform"))
 }
 
 // Реализация Drop не нужна, так как File автоматически закрывается при выходе из области видимости. 

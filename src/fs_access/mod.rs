@@ -24,7 +24,7 @@ pub trait MountedStorage {
 }
 
 /// Создает и возвращает реализацию EncryptedStorage для текущей платформы
-pub fn create_encrypted_storage(config: common::EncryptedStorageBase) -> Box<dyn EncryptedStorage> {
+pub fn create_encrypted_storage(_config: common::EncryptedStorageBase) -> Box<dyn EncryptedStorage> {
     #[cfg(target_os = "windows")]
     {
         // Temporarily return a placeholder until the Windows module is fixed
@@ -34,7 +34,7 @@ pub fn create_encrypted_storage(config: common::EncryptedStorageBase) -> Box<dyn
     
     #[cfg(target_os = "linux")]
     {
-        Box::new(linux::LinuxEncryptedStorage::new(config))
+        Box::new(linux::LinuxEncryptedStorage::new(_config))
     }
     
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]

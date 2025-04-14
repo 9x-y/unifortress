@@ -3,7 +3,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Write, Read};
 
 const APP_NAME: &str = "UniFortress Auto-Mount";
 

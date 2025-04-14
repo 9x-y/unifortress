@@ -15,7 +15,8 @@ use crate::utils::parse_size;
 use std::io::{self, Write};
 use crate::mount::EncryptedFsHandler;
 use crate::platform::windows::{check_drive_letter_availability, check_dokan_driver};
-use dokan::{Dokan, MountFlags, MountPoint, MountOptions};
+use dokan::*; // Используем всё из dokan для упрощения
+use rand;
 
 /// Структура для парсинга аргументов командной строки
 #[derive(Parser, Debug)]
@@ -61,41 +62,8 @@ struct UnlockArgs {
     // TODO: Добавить опции
 }
 
-fn main() -> anyhow::Result<()> {
-    env_logger::init();
-    info!("UniFortress v{} запущен", env!("CARGO_PKG_VERSION"));
-
-    let cli = Cli::parse();
-    info!("Получена команда: {:?}", cli.command);
-
-    // Обработка команды
-    match cli.command {
-        Commands::Encrypt(args) => {
-            info!("Выбрана команда Encrypt для устройства: {:?}", args.file);
-            // Запускаем обработчик в отдельной функции, чтобы main не разрасталась
-            if let Err(e) = handle_encrypt(args) {
-                // Выводим ошибку в stderr для пользователя
-                eprintln!("\nОшибка шифрования: {}", e); // Добавим \n на случай если ошибка после прогресса
-                // Логируем с деталями
-                error!("Encryption failed: {:?}", e);
-                std::process::exit(1); // Завершаемся с кодом ошибки
-            }
-        }
-        Commands::Unlock(args) => {
-            info!(
-                "Выбрана команда Unlock для устройства: {:?} (точка монтирования: {:?})",
-                args.file,
-                args.mount_point
-            );
-            if let Err(e) = handle_unlock(args) {
-                eprintln!("Ошибка разблокировки: {}", e);
-                error!("Unlock failed: {:?}", e);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    Ok(())
+fn main() {
+    println!("UniFortress: Используйте команды unifortress или launcher");
 }
 
 // --- Обработчики команд ---
@@ -149,11 +117,13 @@ fn handle_encrypt(args: EncryptArgs) -> anyhow::Result<()> {
 
     // --- Подготовка заголовка ---
     // 4. Создать заголовок
-    let mut header = VolumeHeader::new();
-    info!("Создан новый заголовок тома.");
+    let volume_size = volume.get_size()?;
+    let mut master_key = [0u8; 32]; // AES-256 key
+    let mut hmac_key = [0u8; 32];   // HMAC-SHA256 key
+    rand::thread_rng().fill_bytes(&mut master_key);
+    rand::thread_rng().fill_bytes(&mut hmac_key);
 
-    // 5. Рассчитать ключи (KDF)
-    info!("Генерация ключей из пароля (может занять некоторое время)...");
+    let mut header = VolumeHeader::new(volume_size, sector_size, &master_key, &hmac_key)?;
     let derived_key = derive_key(password.as_bytes(), header.kdf_salt())?;
     info!("Ключи успешно сгенерированы.");
 
@@ -334,7 +304,7 @@ fn handle_unlock(args: UnlockArgs) -> anyhow::Result<()> {
         // Настраиваем опции монтирования
         let mount_options = MountOptions {
             mount_point: mount_point_str,
-            options: dokan::MountFlags::REMOVABLE,
+            options: MountFlags::REMOVABLE,
             ..Default::default()
         };
 
@@ -342,7 +312,7 @@ fn handle_unlock(args: UnlockArgs) -> anyhow::Result<()> {
         // Это блокирующий вызов - он будет работать, пока диск не будет размонтирован
         info!("Инициализация Dokan для точки монтирования {}", mount_point_str);
         
-        match dokan::Drive::mount(fs_handler, &mount_options) {
+        match Drive::mount(fs_handler, &mount_options) {
             Ok(drive) => {
                 println!("Диск успешно смонтирован на {}.", mount_point_str);
                 println!("Теперь вы можете получить доступ к данным через проводник или командную строку.");
