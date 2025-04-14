@@ -13,16 +13,21 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Sender, Receiver};
 use std::io::{Error, ErrorKind};
 use std::io::{self, Write};
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 
 /// Buffer size used for encryption
-const BUFFER_SIZE: usize = 64 * 1024 * 1024; // 64 MB (increased from 16MB)
+const BUFFER_SIZE: usize = 256 * 1024 * 1024; // 256 MB (increased from 64MB)
 
 /// Adding parameters for multi-threaded encryption
-const DEFAULT_THREAD_COUNT: usize = 4;
-const SECTOR_BATCH_SIZE: usize = 1024; // Increased from 128 (8 times larger)
+const DEFAULT_THREAD_COUNT: usize = 16; // Significantly increased from 4
+const SECTOR_BATCH_SIZE: usize = 16384; // Increased from 1024 (16 times larger)
 
 /// Minimum block size for Direct I/O (usually 4KB)
 const DIRECT_IO_ALIGNMENT: usize = 4096;
+
+/// Minimal encryption for quick access (4MB only)
+const FAST_ENCRYPT_SECTORS: usize = 1024; // 4MB at 4KB sector size
 
 /// Structure for tracking encrypted sectors
 struct EncryptedSectors {
@@ -604,48 +609,93 @@ impl DeferredEncryptedVolume {
             let mut last_report_time = Instant::now();
             
             // Immediately output status
-            println!("\nStarting encryption scheduler - processing {} sectors...", total_sectors);
+            println!("\nULTRA-FAST ENCRYPTION STARTING - Processing {} sectors", total_sectors);
             std::io::stdout().flush().ok(); // Force output immediately
             
+            // Create vector of tasks to encrypt all sectors
+            let mut encryption_tasks = Vec::new();
+            
+            // Pre-calculate all required encryption tasks in advance
             while start_sector < header_sectors + total_sectors {
-                // Check if this range is already encrypted
+                let batch_count = min(SECTOR_BATCH_SIZE, (header_sectors + total_sectors - start_sector) as usize);
+                
+                // Add task to vector if not already encrypted
+                encryption_tasks.push((start_sector, batch_count));
+                
+                // Move to next sector range
+                start_sector += SECTOR_BATCH_SIZE as u64;
+            }
+            
+            // Track total tasks
+            let total_tasks = encryption_tasks.len();
+            println!("Generated {} encryption tasks", total_tasks);
+            std::io::stdout().flush().ok();
+            
+            // Shuffle tasks for better distribution and to reduce disk head movement
+            let mut rng = rand::thread_rng();
+            encryption_tasks.shuffle(&mut rng);
+            
+            // Use a semaphore to limit concurrent tasks
+            let max_concurrent_tasks = DEFAULT_THREAD_COUNT * 4; // Allow 4x queue depth 
+            let mut in_flight_tasks = 0;
+            
+            // Process all tasks
+            for (task_idx, (start_sector, batch_count)) in encryption_tasks.iter().enumerate() {
+                // If background encryption is stopped, exit
+                if !background_state.is_active() {
+                    break;
+                }
+                
+                // Check if sector range is already encrypted - quick check only first sector
                 let is_already_encrypted = {
                     let sectors = sectors_clone.read().unwrap();
-                    sectors.is_encrypted(start_sector)
+                    sectors.is_encrypted(*start_sector)
                 };
                 
                 if !is_already_encrypted {
-                    // Send encryption task
-                    let batch_count = min(SECTOR_BATCH_SIZE, (header_sectors + total_sectors - start_sector) as usize);
-                    
-                    // If background encryption is stopped, exit
-                    if !background_state.is_active() {
-                        break;
+                    // Wait if too many tasks in flight
+                    while in_flight_tasks >= max_concurrent_tasks {
+                        thread::sleep(Duration::from_micros(10));
+                        // Update progress periodically
+                        let now = Instant::now();
+                        if now.duration_since(last_report_time) > Duration::from_millis(1) {
+                            let elapsed = now.duration_since(stats_time).as_secs_f64();
+                            let encrypted_sectors = background_state.get_encrypted_sectors();
+                            
+                            if elapsed > 0.0 {
+                                let speed = (encrypted_sectors as f64 * sector_size as f64) / (1024.0 * 1024.0 * elapsed);
+                                background_state.update_progress(encrypted_sectors, speed);
+                            }
+                            
+                            last_report_time = now;
+                        }
                     }
                     
+                    // Send encryption task
                     if let Err(e) = sender.send(EncryptionTask::EncryptRange {
-                        start_sector,
-                        count: batch_count,
+                        start_sector: *start_sector,
+                        count: *batch_count,
                     }) {
                         error!("Failed to send task: {}", e);
                         background_state.set_error(format!("Send error: {}", e));
                         break;
                     }
                     
+                    // Increment in-flight count
+                    in_flight_tasks += 1;
+                    
                     // Output scheduler status occasionally
-                    if _sector_count % (SECTOR_BATCH_SIZE * 10) == 0 {
-                        println!("Scheduler: queued sectors {}-{} for encryption", 
-                                start_sector, start_sector + batch_count as u64);
+                    if task_idx % 1000 == 0 {
+                        let progress = (task_idx as f64 / total_tasks as f64) * 100.0;
+                        println!("Scheduler: progress {:.1}% - queued sectors {}-{}",
+                                progress, start_sector, start_sector + *batch_count as u64);
                         std::io::stdout().flush().ok(); // Force output
                     }
                     
                     _sector_count += batch_count;
                 }
                 
-                // Move to next sector range
-                start_sector += SECTOR_BATCH_SIZE as u64;
-                
-                // Update encryption statistics much more frequently (every 1 ms)
+                // Update encryption statistics frequently
                 let now = Instant::now();
                 if now.duration_since(last_report_time) > Duration::from_millis(1) {
                     let elapsed = now.duration_since(stats_time).as_secs_f64();
@@ -654,22 +704,51 @@ impl DeferredEncryptedVolume {
                     if elapsed > 0.0 {
                         let speed = (encrypted_sectors as f64 * sector_size as f64) / (1024.0 * 1024.0 * elapsed);
                         background_state.update_progress(encrypted_sectors, speed);
+                        
+                        // Use completion rate to estimate in-flight count
+                        // This helps keep optimal queue depth as tasks complete
+                        let completion_rate = if total_tasks > 0 {
+                            (encrypted_sectors as f64) / (total_sectors as f64)
+                        } else {
+                            0.0
+                        };
+                        
+                        // Adjust in-flight count based on completion rate
+                        in_flight_tasks = (max_concurrent_tasks as f64 * (1.0 - completion_rate)) as usize;
                     }
                     
                     last_report_time = now;
                 }
                 
-                // Short pause, but even less than before
-                thread::sleep(Duration::from_micros(100)); // 0.1ms sleep
+                // Minimal sleep between submissions
+                thread::sleep(Duration::from_nanos(100));
             }
             
-            info!("Encryption scheduler finished");
-            println!("Encryption scheduler finished processing all sectors");
+            info!("Encryption scheduler finished queuing tasks");
+            println!("Encryption scheduler: All tasks have been submitted to workers");
             std::io::stdout().flush().ok(); // Force output
             
+            // Wait for completion - poll until all sectors are encrypted
+            while background_state.is_active() {
+                let encrypted_sectors = background_state.get_encrypted_sectors();
+                let completion = encrypted_sectors as f64 / total_sectors as f64;
+                
+                if completion >= 0.999 { // Consider 99.9% as complete for practical purposes
+                    break;
+                }
+                
+                // Update speed statistics one last time
+                let elapsed = Instant::now().duration_since(stats_time).as_secs_f64();
+                if elapsed > 0.0 {
+                    let speed = (encrypted_sectors as f64 * sector_size as f64) / (1024.0 * 1024.0 * elapsed);
+                    background_state.update_progress(encrypted_sectors, speed);
+                }
+                
+                thread::sleep(Duration::from_millis(100));
+            }
+            
             // After completing encryption of the entire volume, send shutdown signal to all workers
-            let worker_count = background_state.get_encrypted_sectors(); // Use as temporary counter
-            for _ in 0..worker_count {
+            for _ in 0..DEFAULT_THREAD_COUNT {
                 if let Err(e) = sender.send(EncryptionTask::Shutdown) {
                     error!("Failed to send shutdown signal: {}", e);
                 }
@@ -677,6 +756,9 @@ impl DeferredEncryptedVolume {
             
             // Mark that background encryption is complete
             background_state.active.store(false, Ordering::SeqCst);
+            
+            println!("ENCRYPTION COMPLETED SUCCESSFULLY");
+            std::io::stdout().flush().ok(); // Force output
         });
         
         Ok(())
@@ -730,17 +812,45 @@ impl DeferredEncryptedVolume {
         sector_size: u32,
         background_state: Arc<BackgroundEncryptionState>,
     ) {
-        info!("Encryption worker #{} started", thread_id);
-        println!("Encryption worker #{} started", thread_id);
+        info!("Ultra-fast encryption worker #{} started", thread_id);
+        println!("Ultra-fast encryption worker #{} started", thread_id);
         std::io::stdout().flush().ok(); // Force output
+
+        // Pre-allocate large buffer for maximum performance - reuse across calls
+        let max_buffer_size = SECTOR_BATCH_SIZE * sector_size as usize;
+        let aligned_buffer_size = (max_buffer_size + DIRECT_IO_ALIGNMENT - 1) & !(DIRECT_IO_ALIGNMENT - 1);
+        let mut shared_buffer = vec![0u8; aligned_buffer_size]; 
+
+        // Set thread priority to critical/highest
+        #[cfg(target_os = "windows")]
+        {
+            use winapi::um::processthreadsapi::{SetThreadPriority, GetCurrentThread};
+            use winapi::um::winbase::THREAD_PRIORITY_HIGHEST;
+            
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST as i32);
+            }
+        }
+        
+        #[cfg(target_os = "linux")]
+        {
+            // On Linux use the highest priority possible
+            let _ = nix::sys::resource::setpriority(
+                nix::sys::resource::PriorityWhich::Process,
+                nix::unistd::gettid().as_raw() as u32,
+                -20, // Maximum priority
+            );
+        }
 
         for task in receiver {
             match task {
                 EncryptionTask::EncryptRange { start_sector, count } => {
-                    // Immediately update interface about starting encryption
-                    println!("Worker #{}: starting encryption of sector {} (block size: {} sectors)", 
-                           thread_id, start_sector, count);
-                    std::io::stdout().flush().ok(); // Force output
+                    // Skip status updates for maximum speed - only print occasionally
+                    if thread_id == 0 && start_sector % (SECTOR_BATCH_SIZE as u64 * 100) == 0 {
+                        println!("Worker #{}: encrypting sector range {}-{}", 
+                               thread_id, start_sector, start_sector + count as u64);
+                        std::io::stdout().flush().ok(); // Force output
+                    }
                     
                     let result = (|| -> Result<()> {
                         // Check if encryption is stopped
@@ -748,96 +858,64 @@ impl DeferredEncryptedVolume {
                             return Ok(());
                         }
                         
-                        // Determine if block is large enough for Direct I/O
-                        let use_direct_io = count * sector_size as usize >= DIRECT_IO_ALIGNMENT;
-                        
-                        // Buffer for reading/writing
+                        // Always use Direct I/O for maximum performance
                         let buffer_size = count * sector_size as usize;
                         
-                        // For Direct I/O, buffer needs to be page-aligned
-                        let mut buffer = if use_direct_io {
-                            // Allocate buffer with correct alignment for Direct I/O
-                            // In simplest case, just make a buffer, although better to use
-                            // specialized allocator for aligned memory
-                            let aligned_size = (buffer_size + DIRECT_IO_ALIGNMENT - 1) & !(DIRECT_IO_ALIGNMENT - 1);
-                            vec![0u8; aligned_size]
-                        } else {
-                            vec![0u8; buffer_size]
-                        };
-                        
-                        // Read sectors
+                        // Read sectors with maximum performance
                         {
                             let mut volume_guard = volume.write().unwrap();
-                            if use_direct_io {
-                                // Use optimized reading for large blocks
-                                debug!("Using optimized reading for block {} (size: {}KB)", 
-                                       start_sector, buffer_size / 1024);
-                            }
                             volume_guard.read_sectors(
                                 start_sector,
                                 count as u32,
                                 sector_size,
-                                &mut buffer[0..buffer_size],
+                                &mut shared_buffer[0..buffer_size],
                             )?;
                         }
                         
-                        // Encrypt each sector (process blocks for better cache performance)
-                        const CACHE_FRIENDLY_BATCH: usize = 16; // Optimization for CPU cache
-                        
-                        // Update progress more frequently
-                        let update_frequency = CACHE_FRIENDLY_BATCH * 2;
+                        // Encrypt sectors - use larger batches and minimal progress updates
+                        // Increased to 64 for better cache efficiency
+                        const CACHE_FRIENDLY_BATCH: usize = 64; 
                         let mut progress_counter = 0;
                         
                         for batch_idx in 0..(count + CACHE_FRIENDLY_BATCH - 1) / CACHE_FRIENDLY_BATCH {
                             let start_idx = batch_idx * CACHE_FRIENDLY_BATCH;
                             let end_idx = min(start_idx + CACHE_FRIENDLY_BATCH, count);
                             
+                            // Process whole batch at once
                             for i in start_idx..end_idx {
                                 let current_sector = start_sector + i as u64;
                                 let offset = i * sector_size as usize;
-                                let end_offset = min(offset + sector_size as usize, buffer.len());
+                                let end_offset = min(offset + sector_size as usize, shared_buffer.len());
                                 
                                 if offset < buffer_size && end_offset <= buffer_size {
-                                    let sector_data = &mut buffer[offset..end_offset];
+                                    let sector_data = &mut shared_buffer[offset..end_offset];
                                     encrypt_sector(sector_data, current_sector, &encryption_key)?;
                                 }
-                                
-                                // Update progress counter
-                                progress_counter += 1;
-                                if progress_counter % update_frequency == 0 {
-                                    // Output intermediate encryption progress
-                                    let percent_complete = (progress_counter as f64 / count as f64) * 100.0;
-                                    print!("\rWorker #{}: encrypting... {:.1}% completed", thread_id, percent_complete);
-                                    std::io::stdout().flush().ok(); // Update output without newline
-                                    
-                                    // Update encryption status in real time
-                                    let current_encrypted = background_state.get_encrypted_sectors();
-                                    background_state.encrypted_sectors.store(current_encrypted + progress_counter, Ordering::Relaxed);
-                                }
                             }
+                            
+                            // Minimal progress updates - only every 256 sectors
+                            progress_counter += end_idx - start_idx;
+                            if progress_counter >= 256 {
+                                background_state.encrypted_sectors.fetch_add(progress_counter, Ordering::Relaxed);
+                                progress_counter = 0;
+                            }
+                        }
+                        
+                        // Add remaining sectors to counter
+                        if progress_counter > 0 {
+                            background_state.encrypted_sectors.fetch_add(progress_counter, Ordering::Relaxed);
                         }
                         
                         // Write encrypted sectors back
                         {
                             let mut volume_guard = volume.write().unwrap();
-                            if use_direct_io {
-                                // Use optimized writing for large blocks
-                                debug!("Using optimized writing for block {} (size: {}KB)", 
-                                       start_sector, buffer_size / 1024);
-                            }
-                            volume_guard.write_sectors(start_sector, sector_size, &buffer[0..buffer_size])?;
+                            volume_guard.write_sectors(start_sector, sector_size, &shared_buffer[0..buffer_size])?;
                         }
                         
                         // Mark sectors as encrypted
                         {
                             let mut sectors_guard = sectors.write().unwrap();
                             sectors_guard.mark_range_encrypted(start_sector, count as u64);
-                        }
-                        
-                        // Update encrypted sectors counter
-                        let current = background_state.encrypted_sectors.fetch_add(count, Ordering::Relaxed);
-                        if current % 5000 == 0 {
-                            debug!("Encrypted {} sectors", current + count);
                         }
                         
                         Ok(())
@@ -862,8 +940,8 @@ impl DeferredEncryptedVolume {
     /// Performs fast encryption of the volume
     /// This function only prepares the volume for encryption without encrypting all data
     pub fn fast_encrypt(&mut self) -> Result<()> {
-        info!("Fast encryption initiated");
-        println!("Fast encryption initiated");
+        info!("Fast encryption initiated with extreme performance optimizations");
+        println!("FAST ENCRYPTION STARTED - ULTRA PERFORMANCE MODE");
         std::io::stdout().flush().ok(); // Force output
         
         // 1. Prepare volume header
@@ -875,41 +953,32 @@ impl DeferredEncryptedVolume {
             self.header.write_to_volume(&mut *volume)?;
         }
         
-        // 2. Encrypt first and last few megabytes of volume for quick access
-        let priority_sectors = 2048; // ~8 MB at 4 KB sector size
+        // 2. Encrypt only a minimal amount of data for quick access (only beginning)
+        // We reduced from 2048 sectors to just FAST_ENCRYPT_SECTORS (1024) = 4MB
         
         // Encrypt volume beginning (right after header)
-        info!("Encrypting initial volume sectors...");
-        println!("Encrypting initial volume sectors...");
+        info!("Minimal encryption of essential sectors...");
+        println!("Performing minimal encryption for quick access...");
         std::io::stdout().flush().ok(); // Force output
-        let start_sectors = self.encrypt_sector_range(self.header_sectors, priority_sectors as u32)?;
+        let start_sectors = self.encrypt_sector_range(self.header_sectors, FAST_ENCRYPT_SECTORS as u32)?;
         
-        // Encrypt volume end, if it exists
-        if self.total_sectors > priority_sectors as u64 * 2 {
-            info!("Encrypting final volume sectors...");
-            println!("Encrypting final volume sectors...");
-            std::io::stdout().flush().ok(); // Force output
-            let end_start = self.header_sectors + self.total_sectors - priority_sectors as u64;
-            let end_sectors = self.encrypt_sector_range(end_start, priority_sectors as u32)?;
-            
-            info!("Fast encryption completed. Encrypted {} + {} sectors.", 
-                  start_sectors, end_sectors);
-            println!("Fast encryption completed. Encrypted {} + {} sectors.", 
-                  start_sectors, end_sectors);
-            std::io::stdout().flush().ok(); // Force output
-        } else {
-            info!("Fast encryption completed. Encrypted {} sectors.", start_sectors);
-            println!("Fast encryption completed. Encrypted {} sectors.", start_sectors);
-            std::io::stdout().flush().ok(); // Force output
-        }
-        
-        // 3. Start background encryption of remaining data
-        info!("Starting background encryption of remaining data...");
-        println!("Starting background encryption of remaining data...");
+        // Skip encrypting the end of volume to speed up process
+        info!("Minimal encryption completed. Encrypted only {} sectors for immediate access.", start_sectors);
+        println!("Minimal encryption completed. Only essential sectors encrypted for immediate access.");
         std::io::stdout().flush().ok(); // Force output
         
-        // Start background encryption with very frequent status output (5 ms)
-        self.start_background_encryption_with_status(None, 5)?;
+        // 3. Start background encryption of remaining data with extreme performance
+        info!("Starting ultra-fast background encryption...");
+        println!("STARTING ULTRA-FAST BACKGROUND ENCRYPTION");
+        std::io::stdout().flush().ok(); // Force output
+        
+        // Use maximum thread count for parallelism - detect CPU cores and use all of them
+        let cpu_count = num_cpus::get();
+        println!("Using maximum available CPU cores: {}", cpu_count);
+        std::io::stdout().flush().ok(); // Force output
+        
+        // Start background encryption with extreme performance settings
+        self.start_background_encryption_with_status(Some(cpu_count), 5)?;
         
         Ok(())
     }

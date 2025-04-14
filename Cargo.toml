@@ -5,36 +5,37 @@ edition = "2021"
 
 [dependencies]
 # Криптография
-aes = "0.8"
+aes = "0.8.3"
 xts-mode = { git = "https://github.com/pheki/xts-mode", version = "0.5.1", features = ["std"] }
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.12.1"
+sha2 = "0.10.8"
 argon2 = "0.5"
-rand = "0.8"
+rand = "0.8.5"
 rand_core = "0.6"
 chacha20poly1305 = "0.10.1"
 
 # Параллельная обработка и асинхронность
-rayon = "1.8"
-tokio = { version = "1.32", features = ["full"] }
-futures = "0.3"
-num_cpus = "1.15"
+rayon = "1.8.0"
+tokio = { version = "1.34.0", features = ["rt", "rt-multi-thread", "fs", "io-util", "sync", "time"] }
+futures = "0.3.29"
+futures-util = "0.3.29"
+num_cpus = "1.16.0"
 
 # Обработка ошибок
-anyhow = "1.0"
+anyhow = "1.0.75"
 
 # Сериализация / Десериализация
 serde = { version = "1.0", features = ["derive"] } # 'derive' фича для удобного использования с struct/enum
 bincode = "1.3"
 
 # Логирование
-log = "0.4"
-env_logger = "0.11"
+log = "0.4.20"
+env_logger = "0.10.0"
 
 # CLI
-clap = { version = "4.4", features = ["derive"] } # 'derive' фича для удобного парсинга
+clap = { version = "4.4.8", features = ["derive"] } # 'derive' фича для удобного парсинга
 
-rpassword = "7.3"
+rpassword = "7.3.1"
 
 # UUID
 uuid = { version = "1.7", features = ["v4"] }
@@ -47,7 +48,9 @@ winapi = { version = "0.3.9", features = ["winioctl", "ioapiset", "minwinbase", 
 # Добавленные зависимости для работы с Windows
 lazy_static = "1.4"
 widestring = "1.2.0"
-crossbeam-channel = "0.5.15"
+crossbeam = "0.8.2"
+crossbeam-channel = "0.5.8"
+crossbeam-utils = "0.8.16"
 
 [[bin]]
 name = "unifortress"
