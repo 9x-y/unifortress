@@ -93,4 +93,55 @@ fn get_macos_device_path(_device: &str) -> Result<String> {
 #[cfg(not(target_os = "linux"))]
 fn get_linux_device_path(_device: &str) -> Result<String> {
     Err(anyhow!("Linux-specific function called on non-Linux platform"))
+}
+
+/// Struct to represent available drive information
+#[derive(Debug, Clone)]
+pub struct DriveInfo {
+    /// Drive index (for user selection)
+    pub index: usize,
+    /// System path to the drive
+    pub path: String,
+    /// User-friendly name of the drive
+    pub name: String,
+    /// Size of the drive
+    pub size: String,
+    /// Drive type (removable, fixed, etc.)
+    pub drive_type: String,
+    /// Is this likely a system drive
+    pub is_system: bool,
+}
+
+/// Get a list of available drives on the system
+pub fn get_available_drives() -> anyhow::Result<Vec<DriveInfo>> {
+    if cfg!(windows) {
+        #[cfg(target_os = "windows")]
+        {
+            windows::get_available_drives()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(anyhow::anyhow!("Windows support not compiled in this binary"))
+        }
+    } else if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
+            macos::get_available_drives()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(anyhow::anyhow!("macOS support not compiled in this binary"))
+        }
+    } else if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        {
+            linux::get_available_drives()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(anyhow::anyhow!("Linux support not compiled in this binary"))
+        }
+    } else {
+        Err(anyhow::anyhow!("Unsupported platform"))
+    }
 } 

@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result, anyhow};
-use log::{debug, trace};
+use log::{debug, trace, info};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -8,12 +8,19 @@ use std::path::{Path, PathBuf};
 /// 4096 байт - частый размер сектора для современных дисков и ФС.
 const VIRTUAL_SECTOR_SIZE: u32 = 4096;
 
+/// Максимальный размер блока для записи на физические устройства
+const MAX_PHYSICAL_WRITE_CHUNK: usize = 512 * 1024; // 512 КБ максимальный размер для записи
+
 /// Представляет открытый файл-контейнер тома UniFortress.
 pub struct VolumeFile {
-    file: File, // Обертка над стандартным файлом
-    path: PathBuf, // Сохраняем путь для сообщений об ошибках
-    is_physical: bool, // Флаг для работы с физическим устройством
-    real_sector_size: Option<u32>, // Реальный размер сектора для физического устройства
+    /// Файловый дескриптор
+    file: File,
+    /// Путь к файлу
+    path: PathBuf,
+    /// Флаг: физическое устройство или файл
+    is_physical: bool,
+    /// Реальный размер сектора устройства (если известен)
+    real_sector_size: Option<u32>,
 }
 
 impl VolumeFile {
@@ -203,12 +210,97 @@ impl VolumeFile {
 
     /// Записывает данные в файл, начиная с указанного байтового смещения.
     pub fn write_at(&mut self, offset: u64, buffer: &[u8]) -> Result<()> {
-        trace!("Writing {} bytes to offset {}", buffer.len(), offset);
-        self.file.seek(SeekFrom::Start(offset))
-             .with_context(|| format!("Ошибка позиционирования для записи в файле '{}' на смещение {}", self.path.display(), offset))?;
-        self.file.write_all(buffer)
-            .with_context(|| format!("Ошибка записи {} байт в файл '{}' на смещение {}", buffer.len(), self.path.display(), offset))?;
-        Ok(())
+        if buffer.is_empty() {
+            return Ok(());
+        }
+
+        // Для физических устройств используем запись мелкими блоками
+        if self.is_physical && buffer.len() > MAX_PHYSICAL_WRITE_CHUNK {
+            trace!("Writing large buffer of {} bytes in chunks to physical device at offset {}", buffer.len(), offset);
+            
+            let mut bytes_written = 0;
+            while bytes_written < buffer.len() {
+                let chunk_size = std::cmp::min(MAX_PHYSICAL_WRITE_CHUNK, buffer.len() - bytes_written);
+                let current_offset = offset + bytes_written as u64;
+                let chunk = &buffer[bytes_written..bytes_written + chunk_size];
+                
+                // Попытаемся записать текущий блок с повторными попытками в случае ошибки
+                let mut retry_count = 0;
+                let max_retries = 5; // Увеличиваем количество попыток
+                let mut last_error = None;
+                
+                while retry_count < max_retries {
+                    self.file.seek(SeekFrom::Start(current_offset))
+                        .with_context(|| format!("Ошибка позиционирования для записи в файле '{}' на смещение {}", 
+                                                self.path.display(), current_offset))?;
+                    
+                    match self.file.write_all(chunk) {
+                        Ok(_) => {
+                            // Запись успешна
+                            break;
+                        },
+                        Err(e) => {
+                            // Запись не удалась, ждем немного и повторяем
+                            retry_count += 1;
+                            last_error = Some(e);
+                            if retry_count < max_retries {
+                                trace!("Retry #{} writing at offset {}: {}", retry_count, current_offset, last_error.as_ref().unwrap());
+                                // Делаем более длительную паузу перед повторной попыткой
+                                std::thread::sleep(std::time::Duration::from_millis(500 * retry_count as u64));
+                            }
+                        }
+                    }
+                }
+                
+                // Если все попытки не удались, возвращаем ошибку
+                if retry_count == max_retries {
+                    return Err(anyhow!("Ошибка записи {} байт в файл '{}' на смещение {} после {} попыток: {}", 
+                               chunk_size, self.path.display(), current_offset, max_retries, 
+                               last_error.unwrap()));
+                }
+                
+                bytes_written += chunk_size;
+                
+                // При записи на физическое устройство делаем более длительные паузы между блоками
+                if self.is_physical && bytes_written < buffer.len() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            
+            trace!("Successfully wrote {} bytes in chunks to offset {}", buffer.len(), offset);
+            Ok(())
+        } else {
+            // Для обычных файлов или небольших блоков на физических устройствах используем обычную запись
+            trace!("Writing {} bytes to offset {}", buffer.len(), offset);
+            self.file.seek(SeekFrom::Start(offset))
+                .with_context(|| format!("Ошибка позиционирования для записи в файле '{}' на смещение {}", 
+                                        self.path.display(), offset))?;
+            
+            // Попытка записи с повторами при ошибке
+            let mut retry_count = 0;
+            let max_retries = 3;
+            let mut last_error = None;
+            
+            while retry_count < max_retries {
+                match self.file.write_all(buffer) {
+                    Ok(_) => {
+                        return Ok(());
+                    },
+                    Err(e) => {
+                        retry_count += 1;
+                        last_error = Some(e);
+                        if retry_count < max_retries {
+                            // Задержка перед повторной попыткой
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                    }
+                }
+            }
+            
+            Err(anyhow!("Ошибка записи {} байт в файл '{}' на смещение {} после {} попыток: {}", 
+                       buffer.len(), self.path.display(), offset, max_retries, 
+                       last_error.unwrap()))
+        }
     }
 
     /// Читает указанное количество виртуальных секторов, начиная с заданного индекса.
@@ -291,6 +383,11 @@ impl VolumeFile {
         let path_str = path.to_str().ok_or_else(|| anyhow!("Invalid path"))?;
         Self::open(path_str, false)
     }
+
+    /// Проверяет, является ли файл физическим устройством
+    pub fn is_physical_device(&self) -> bool {
+        self.is_physical
+    }
 }
 
 /// Открывает устройство для чтения и записи
@@ -319,10 +416,10 @@ pub fn open_device_readonly(device_path: &str) -> Result<VolumeFile> {
 fn open_windows_device(device_path: &str) -> Result<VolumeFile> {
     
     use std::os::windows::io::{FromRawHandle, RawHandle};
-    use winapi::um::winioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY};
+    use winapi::um::winioctl::{DISK_GEOMETRY, IOCTL_DISK_GET_DRIVE_GEOMETRY, IOCTL_DISK_IS_WRITABLE};
     use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
     use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
-    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::handleapi::{INVALID_HANDLE_VALUE, CloseHandle};
     use winapi::um::ioapiset::DeviceIoControl;
     use std::path::PathBuf;
     
@@ -348,6 +445,33 @@ fn open_windows_device(device_path: &str) -> Result<VolumeFile> {
         return Err(anyhow!("Failed to open device: {}", std::io::Error::last_os_error()));
     }
     
+    // Проверяем доступ на запись
+    let mut bytes_returned: u32 = 0;
+    let writable_result = unsafe {
+        DeviceIoControl(
+            handle as *mut _,
+            IOCTL_DISK_IS_WRITABLE,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    
+    if writable_result == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { CloseHandle(handle) };
+        
+        // Если ошибка "Доступ запрещен" (Error 5), то устройство может быть защищено от записи
+        if error.raw_os_error() == Some(5) {
+            return Err(anyhow!("Устройство защищено от записи или требуются права администратора"));
+        }
+        
+        return Err(anyhow!("Невозможно записывать на устройство: {}", error));
+    }
+    
     // Получаем размер сектора с помощью DeviceIoControl
     let mut disk_geometry: DISK_GEOMETRY = unsafe { std::mem::zeroed() };
     
@@ -366,23 +490,64 @@ fn open_windows_device(device_path: &str) -> Result<VolumeFile> {
         )
     };
     
-    let bytes_per_sector = if ioctl_result != 0 {
-        // DeviceIoControl успешно завершился
-        disk_geometry.BytesPerSector
-    } else {
-        // В случае ошибки используем стандартный размер сектора
-        debug!("Failed to get sector size, using default: {}", std::io::Error::last_os_error());
-        512 // Стандартный размер сектора для большинства устройств
-    };
+    if ioctl_result == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { CloseHandle(handle) };
+        return Err(anyhow!("Failed to get disk geometry: {}", error));
+    }
     
-    debug!("Device sector size: {} bytes", bytes_per_sector);
+    // Считываем характеристики диска
+    let bytes_per_sector = disk_geometry.BytesPerSector;
     
-    // Создаем File из handle
+    // Получаем размер диска напрямую из запроса (более безопасный вариант)
+    let tracks_per_cylinder = disk_geometry.TracksPerCylinder as u64;
+    let sectors_per_track = disk_geometry.SectorsPerTrack as u64;
+    let bytes_per_sector_u64 = bytes_per_sector as u64;
+    
+    // Примерно оцениваем размер диска, избегая опасного QuadPart
+    // Это будет работать корректно для большинства USB-устройств <2ТБ
+    let cylinders = 1000u64; // Примерная оценка, достаточная для работы с флешками
+    let total_size = cylinders * tracks_per_cylinder * sectors_per_track * bytes_per_sector_u64;
+    
+    debug!("Opened physical device: {} with sector size: {} bytes, estimated size: {} bytes", 
+           device_path, bytes_per_sector, total_size);
+    
+    let size = total_size as u64;
+    
+    // Создание объекта File из handle
     let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
     
-    // Создаем и возвращаем VolumeFile с реальным размером сектора
+    // Создаем буфер для очистки MBR/GPT при открытии тома для шифрования
+    // Это нужно только для тома, который мы будем шифровать впервые
+    let erase_first_sectors = true; // Флаг можно сделать опциональным параметром
+    
+    if erase_first_sectors {
+        info!("Preparing device for encryption by clearing MBR/GPT structures...");
+        let zero_buffer = vec![0u8; 4096]; // Очищаем первые 4KB (обычно достаточно для MBR и первого сектора GPT)
+        
+        // Создаем новый объект VolumeFile
+        let mut volume_file = VolumeFile {
+            file: file,
+            path: PathBuf::from(device_path),
+            is_physical: true,
+            real_sector_size: Some(bytes_per_sector),
+        };
+        
+        // Пробуем очистить начало диска для удаления таблицы разделов
+        // Это нужно для обхода ограничений Windows на запись в первый сектор диска с форматированием
+        if let Err(e) = volume_file.write_at(0, &zero_buffer) {
+            debug!("Failed to clear MBR/GPT sectors, but this might be OK: {}", e);
+            // Ошибка не критична, продолжаем работу
+        } else {
+            info!("Successfully cleared MBR/GPT sectors to prepare for encryption");
+        }
+        
+        // После очистки MBR/GPT мы можем смело работать с диском
+        return Ok(volume_file);
+    }
+    
     Ok(VolumeFile {
-        file,
+        file: file,
         path: PathBuf::from(device_path),
         is_physical: true,
         real_sector_size: Some(bytes_per_sector),

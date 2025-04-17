@@ -52,6 +52,8 @@ crossbeam = "0.8.2"
 crossbeam-channel = "0.5.8"
 crossbeam-utils = "0.8.16"
 
+parking_lot = "0.12.1"
+
 [[bin]]
 name = "unifortress"
 path = "src/bin/disk_encrypt.rs"

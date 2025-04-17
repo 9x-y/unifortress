@@ -1,13 +1,17 @@
 use serde::{Deserialize, Serialize};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Result, anyhow};
 use argon2::{
     Argon2,
     Params,
+    password_hash::PasswordHasher,
 };
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
-use sha2::Sha256;
+use sha2::{Sha256, Digest};
 use uuid::Uuid;
+use bincode;
+use log::{debug, error, info, warn};
+use crate::platform::volume_io::VolumeFile;
 // use aes::Aes256;
 
 use crate::crypto::xts::XTS_KEY_SIZE;
@@ -149,254 +153,346 @@ pub fn encrypt_sector(
         .map_err(|e| anyhow::anyhow!("Failed to encrypt sector: {}", e))
 }
 
-/// Шифрует полное устройство/том с заданным паролем.
-///
-/// # Arguments
-/// * `device_path` - Путь к устройству, которое нужно зашифровать.
-/// * `password` - Пароль для шифрования.
-///
-/// # Returns
-/// Ok(()) при успешном шифровании или ошибку.
-pub fn encrypt_volume(device_path: &str, password: &str) -> Result<()> {
-    // Import rayon for parallel processing and tokio for async IO
+/// Структура для хранения статистики шифрования
+pub struct EncryptionStats {
+    pub sectors_processed: u64,
+    pub bytes_processed: u64, 
+    pub duration: std::time::Duration,
+}
+
+/// Шифрует все секторы данных параллельно с использованием нескольких потоков
+fn encrypt_sectors_parallel(
+    volume: &mut VolumeFile, 
+    key: &[u8; 64], 
+    num_threads: usize,
+    sector_size: usize
+) -> Result<EncryptionStats> {
     use rayon::prelude::*;
     use std::sync::{Arc, Mutex};
-    use tokio::runtime::Runtime;
-    use tokio::sync::Semaphore;
-    use futures::stream::{StreamExt, FuturesUnordered};
+    use std::time::Instant;
     
-    // Create tokio runtime for async operations
-    let rt = Runtime::new()
-        .context("Failed to create tokio runtime")?;
+    // Определяем размер буфера для чтения/записи (не более 4 МБ для совместимости)
+    let buffer_size = 4 * 1024 * 1024; // 4 МБ
+    let sectors_per_buffer = buffer_size / sector_size;
     
-    // Execute async encryption process in the tokio runtime
-    rt.block_on(async {
-        // Открываем устройство
-        let mut volume = volume_io::open_device(device_path)?;
-        
-        // Получаем параметры устройства
-        let volume_size = volume.get_size()?;
-        let sector_size = volume.get_sector_size();
-        
-        // Генерируем соль
-        let salt = generate_salt();
-        
-        // Выводим ключ из пароля
-        let derived_key = derive_key(password.as_bytes(), &salt)?;
-        
-        // Разделяем ключ на XTS ключ и HMAC ключ
-        let (xts_key, hmac_key) = split_derived_key(&derived_key)?;
-        
-        // Создаем заголовок тома
-        let header = VolumeHeader::new(volume_size, sector_size, &xts_key, &hmac_key)?;
-        
-        // Записываем заголовок в устройство
-        header.write_to_volume(&mut volume)?;
-        
-        // Увеличим размер буфера для более эффективного I/O
-        let buffer_size = 16 * 1024 * 1024; // 16 МБ
-        let sectors_per_buffer = buffer_size / sector_size as usize;
-        
-        // Вычисляем, сколько секторов нужно зашифровать (за вычетом заголовка)
-        let header_sectors = 1; // Сейчас заголовок занимает 1 сектор
-        let total_sectors = volume_size / sector_size as u64;
-        
-        if total_sectors <= header_sectors {
-            bail!("Устройство слишком маленькое для шифрования");
-        }
-        
-        // Шифруем секторы данных
-        let sectors_to_encrypt = total_sectors - header_sectors;
-        let buffer_iterations = (sectors_to_encrypt + sectors_per_buffer as u64 - 1) / sectors_per_buffer as u64;
-        
-        log::info!("Starting encryption of {} sectors (sector size: {} bytes)...", 
-                   sectors_to_encrypt, sector_size);
-        
-        // Create a thread-safe reference to the XTS key and volume
-        let xts_key = Arc::new(xts_key);
-        let volume = Arc::new(Mutex::new(volume));
-        
-        // Create a thread-safe progress counter
-        let progress_counter = Arc::new(Mutex::new(0u64));
-        let encrypted_bytes = Arc::new(Mutex::new(0u64));
-        let start_time = std::time::Instant::now();
-        let total_bytes = sectors_to_encrypt * sector_size as u64;
-        let total_iterations = buffer_iterations;
-        
-        // Limit concurrent async tasks with a semaphore
-        let semaphore = Arc::new(Semaphore::new(8)); // Limit to 8 concurrent writes
-        
-        // Setup progress reporting in a separate task
-        let progress_counter_clone = Arc::clone(&progress_counter);
-        let encrypted_bytes_clone = Arc::clone(&encrypted_bytes);
-        
-        log::info!("Total data to encrypt: {:.2} GB", total_bytes as f64 / 1_073_741_824.0);
-        
-        let progress_task = tokio::spawn(async move {
-            let mut last_progress_percent = 0.0;
-            let mut last_update = std::time::Instant::now();
-            let mut last_bytes = 0u64;
-            
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                let current = *progress_counter_clone.lock().unwrap();
-                let current_bytes = *encrypted_bytes_clone.lock().unwrap();
-                let elapsed = start_time.elapsed().as_secs_f64();
-                
-                if current >= total_iterations {
-                    // Calculate final speed
-                    let speed_mb_sec = if elapsed > 0.0 {
-                        (current_bytes as f64 / 1_048_576.0) / elapsed
-                    } else {
-                        0.0
-                    };
-                    
-                    log::info!("Encryption progress: 100.0% - Completed in {:.1} seconds ({:.2} MB/sec)",
-                               elapsed, speed_mb_sec);
-                    break;
-                }
-                
-                let progress = current_bytes as f64 / total_bytes as f64 * 100.0;
-                let now = std::time::Instant::now();
-                let update_interval = now.duration_since(last_update).as_secs_f64();
-                
-                // Update progress more frequently - every 0.1% change or every 100ms
-                if (progress - last_progress_percent).abs() >= 0.1 || update_interval >= 0.1 {
-                    // Calculate speed in MB/sec
-                    let bytes_since_last = current_bytes - last_bytes;
-                    let speed_mb_sec = if update_interval > 0.0 {
-                        (bytes_since_last as f64 / 1_048_576.0) / update_interval
-                    } else {
-                        0.0
-                    };
-                    
-                    // Estimate time remaining
-                    let remaining_bytes = total_bytes - current_bytes;
-                    let remaining_secs = if speed_mb_sec > 0.0 {
-                        (remaining_bytes as f64 / 1_048_576.0) / speed_mb_sec
-                    } else {
-                        0.0
-                    };
-                    
-                    // Format remaining time
-                    let remaining_fmt = if remaining_secs > 60.0 * 60.0 {
-                        format!("{:.1} hours", remaining_secs / 3600.0)
-                    } else if remaining_secs > 60.0 {
-                        format!("{:.1} minutes", remaining_secs / 60.0)
-                    } else {
-                        format!("{:.1} seconds", remaining_secs)
-                    };
-                    
-                    log::info!("Encryption progress: {:.3}% - Speed: {:.2} MB/sec - ETA: {} - Bytes: {}/{}", 
-                               progress, speed_mb_sec, remaining_fmt, current_bytes, total_bytes);
-                    
-                    last_progress_percent = progress;
-                    last_update = now;
-                    last_bytes = current_bytes;
+    // Получаем размер тома и вычисляем количество секторов
+    let volume_size = volume.get_size()?;
+    let total_sectors = volume_size / sector_size as u64;
+    
+    // Пропускаем первые сектора, где находится заголовок (обычно 1)
+    let header_sectors = 1;
+    
+    // Проверка на минимальный размер
+    if total_sectors <= header_sectors {
+        bail!("Device is too small for encryption");
+    }
+    
+    // Количество секторов для шифрования
+    let sectors_to_encrypt = total_sectors - header_sectors;
+    let buffer_iterations = (sectors_to_encrypt + sectors_per_buffer as u64 - 1) / sectors_per_buffer as u64;
+    
+    // Создаем счетчик прогресса
+    let progress = Arc::new(Mutex::new(0u64));
+    let start_time = Instant::now();
+    
+    // Инициализируем пул потоков rayon
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()?;
+    
+    // Обрабатываем блоки последовательно, но шифруем их параллельно
+    info!("Starting encryption with {} threads, {} sectors per buffer", num_threads, sectors_per_buffer);
+    
+    // Блокировки и результаты ошибок
+    let error_encountered = Arc::new(Mutex::new(None));
+    
+    pool.install(|| {
+        (0..buffer_iterations).into_iter().try_for_each(|i| {
+            // Проверяем, была ли уже ошибка
+            {
+                let error = error_encountered.lock().unwrap();
+                if error.is_some() {
+                    return Err(anyhow!("Encryption stopped due to previous error"));
                 }
             }
-        });
-        
-        // Use FuturesUnordered to process multiple buffers concurrently
-        let mut futures = FuturesUnordered::new();
-        
-        // Get the number of CPU cores for optimal parallelism
-        let num_cpus = num_cpus::get();
-        log::info!("Using {} CPU cores for parallel encryption", num_cpus);
-        
-        for i in 0..buffer_iterations {
+            
+            // Вычисляем текущий сектор и количество секторов для этой итерации
             let current_sector = header_sectors + i * sectors_per_buffer as u64;
             let sectors_this_iteration = std::cmp::min(
                 sectors_per_buffer as u64,
                 sectors_to_encrypt - i * sectors_per_buffer as u64
-            ) as u32;
+            ) as usize;
             
             if sectors_this_iteration == 0 {
+                return Ok(());
+            }
+            
+            // Генерируем случайные данные для буфера (заполняем нулями или случайными)
+            let buffer_size_this_iteration = sectors_this_iteration * sector_size;
+            let mut buffer = vec![0u8; buffer_size_this_iteration];
+            
+            // Для реального устройства заполняем случайными данными
+            if rand::random::<u8>() % 2 == 0 {
+                rand::thread_rng().fill_bytes(&mut buffer);
+            }
+            
+            // Шифруем буфер в параллельных потоках
+            buffer.par_chunks_mut(sector_size)
+                .enumerate()
+                .try_for_each(|(j, sector_data)| {
+                    let sector_index = current_sector + j as u64;
+                    match encrypt_sector(sector_data, sector_index, key) {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            error!("Failed to encrypt sector {}: {}", sector_index, e);
+                            Err(e)
+                        }
+                    }
+                })
+                .map_err(|e| {
+                    let mut error = error_encountered.lock().unwrap();
+                    *error = Some(anyhow!("Encryption error: {}", e));
+                    anyhow!("Failed to encrypt sectors: {}", e)
+                })?;
+            
+            // Записываем зашифрованные данные на устройство небольшими блоками
+            // для совместимости со всеми устройствами
+            const MAX_CHUNK_SIZE: usize = 1 * 1024 * 1024; // 1 МБ максимум за раз
+            
+            let mut offset = 0;
+            while offset < buffer.len() {
+                let chunk_size = std::cmp::min(MAX_CHUNK_SIZE, buffer.len() - offset);
+                let chunk = &buffer[offset..offset + chunk_size];
+                
+                // Вычисляем сектор для этого куска
+                let sector_offset = current_sector + (offset / sector_size) as u64;
+                
+                // Пытаемся записать с повторами в случае ошибки
+                let mut retry_count = 0;
+                let max_retries = 3;
+                let mut last_error = None;
+                let mut success = false;
+                
+                while retry_count < max_retries && !success {
+                    match volume.write_sectors(sector_offset, sector_size as u32, chunk) {
+                        Ok(_) => {
+                            success = true;
+                        },
+                        Err(e) => {
+                            retry_count += 1;
+                            last_error = Some(e);
+                            warn!("Retry #{} writing sectors at {}: {}", 
+                                 retry_count, sector_offset, last_error.as_ref().unwrap());
+                            
+                            // Небольшая пауза перед повторной попыткой
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
+                }
+                
+                if !success {
+                    let error_msg = format!("Failed to write sectors at {} after {} retries: {}", 
+                                          sector_offset, max_retries, last_error.unwrap());
+                    
+                    let mut error = error_encountered.lock().unwrap();
+                    *error = Some(anyhow!(error_msg.clone()));
+                    
+                    return Err(anyhow!(error_msg));
+                }
+                
+                offset += chunk_size;
+            }
+            
+            // Обновляем счетчик прогресса
+            {
+                let mut progress_guard = progress.lock().unwrap();
+                *progress_guard += sectors_this_iteration as u64;
+                
+                // Периодически выводим информацию о прогрессе
+                if i % 10 == 0 || *progress_guard == sectors_to_encrypt {
+                    let percent = (*progress_guard as f64 / sectors_to_encrypt as f64) * 100.0;
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let bytes_processed = *progress_guard * sector_size as u64;
+                    
+                    let speed_mbps = if elapsed > 0.0 {
+                        (bytes_processed as f64 / (1024.0 * 1024.0)) / elapsed
+                    } else {
+                        0.0
+                    };
+                    
+                    let eta_secs = if speed_mbps > 0.0 {
+                        let remaining_bytes = (sectors_to_encrypt - *progress_guard) * sector_size as u64;
+                        (remaining_bytes as f64 / (1024.0 * 1024.0)) / speed_mbps
+                    } else {
+                        0.0
+                    };
+                    
+                    // Форматирование оставшегося времени
+                    let eta_str = if eta_secs > 3600.0 {
+                        format!("{:.1} hours", eta_secs / 3600.0)
+                    } else if eta_secs > 60.0 {
+                        format!("{:.1} minutes", eta_secs / 60.0)
+                    } else {
+                        format!("{:.1} seconds", eta_secs)
+                    };
+                    
+                    info!("Encryption progress: {:.2}% - Speed: {:.2} MB/sec - ETA: {} - Bytes: {}/{}",
+                         percent, speed_mbps, eta_str, bytes_processed, sectors_to_encrypt * sector_size as u64);
+                }
+            }
+            
+            Ok(())
+        })
+    }).map_err(|e| {
+        // Проверяем, есть ли сохраненная ошибка
+        let error = error_encountered.lock().unwrap();
+        if let Some(stored_error) = error.as_ref() {
+            anyhow!("Encryption failed: {}", stored_error)
+        } else {
+            anyhow!("Encryption failed: {}", e)
+        }
+    })?;
+    
+    // Собираем статистику
+    let duration = start_time.elapsed();
+    let sectors_processed = {
+        let progress_guard = progress.lock().unwrap();
+        *progress_guard
+    };
+    let bytes_processed = sectors_processed * sector_size as u64;
+    
+    Ok(EncryptionStats {
+        sectors_processed,
+        bytes_processed,
+        duration,
+    })
+}
+
+/// Шифрует физическое устройство, полностью стирая все данные.
+/// 
+/// * `device_path` - Путь к физическому устройству (например, '\\.\PhysicalDrive1')
+/// * `password` - Пароль для шифрования
+/// * `sector_size` - Размер сектора устройства (обычно автоматически определяется)
+/// 
+/// # Returns
+/// Результат операции шифрования.
+pub fn encrypt_volume(
+    device_path: &str,
+    password: &[u8],
+    sector_size: Option<u32>,
+) -> Result<()> {
+    info!("Starting volume encryption for device: {}", device_path);
+    
+    // Открываем физическое устройство
+    let mut volume = VolumeFile::open(device_path, true)?;  // Теперь указываем true для is_physical
+    info!("Successfully opened device");
+    
+    // Проверяем, является ли устройство реальным физическим устройством
+    if !volume.is_physical_device() {
+        bail!("Cannot encrypt non-physical device. This device isn't recognized as physical.");
+    }
+    
+    // Определяем размер сектора, если не указан
+    let sector_size = match sector_size {
+        Some(size) => size as usize,
+        None => volume.get_sector_size() as usize,
+    };
+    info!("Using sector size: {} bytes", sector_size);
+    
+    // Получаем размер устройства
+    let volume_size = volume.get_size()?;
+    let total_sectors = volume_size / sector_size as u64;
+    info!("Device size: {} bytes, {} sectors", volume_size, total_sectors);
+    
+    // Проверка на минимальный размер (должно быть не менее 2 секторов - 1 для заголовка, 1+ для данных)
+    const MIN_REQUIRED_SECTORS: u64 = 2;
+    if total_sectors < MIN_REQUIRED_SECTORS {
+        bail!("Device is too small for encryption, needs at least {} sectors", MIN_REQUIRED_SECTORS);
+    }
+    
+    // Очищаем MBR, чтобы избежать проблем с остатками файловой системы
+    info!("Clearing MBR to avoid filesystem interference");
+    let zero_buffer = vec![0u8; 512]; // Очищаем только MBR (первые 512 байт)
+    if let Err(e) = volume.write_at(0, &zero_buffer) {
+        warn!("Failed to clear MBR, but continuing: {}", e);
+    }
+    
+    // Генерируем соль для хеширования пароля
+    let salt = generate_salt();
+    
+    // Выводим ключи шифрования из пароля
+    info!("Deriving encryption keys from password");
+    let derived_key = derive_key(password, &salt)?;
+    
+    // Разделяем на ключ для шифрования и ключ для HMAC
+    let (encryption_key, hmac_key) = split_derived_key(&derived_key)?;
+    
+    // Создаем заголовок тома
+    info!("Creating volume header");
+    let header = VolumeHeader::new(volume_size, sector_size as u32, &encryption_key, &hmac_key)?;
+    
+    // Сериализуем заголовок
+    info!("Serializing volume header");
+    let header_bytes = header.serialize()?;
+    
+    // Записываем заголовок в начало тома (первый сектор)
+    info!("Writing volume header");
+    
+    // Попытка записи заголовка с повторами в случае ошибки
+    let mut success = false;
+    for attempt in 1..=5 {
+        match volume.write_at(0, &header_bytes) {
+            Ok(_) => {
+                success = true;
+                info!("Volume header written successfully on attempt {}", attempt);
                 break;
             }
-            
-            // Acquire semaphore permit to limit concurrent tasks
-            let permit = semaphore.clone().acquire_owned().await?;
-            
-            // Clone Arc references for the async task
-            let xts_key_ref = Arc::clone(&xts_key);
-            let volume_ref = Arc::clone(&volume);
-            let progress_counter_ref = Arc::clone(&progress_counter);
-            let encrypted_bytes_ref = Arc::clone(&encrypted_bytes);
-            
-            // Spawn an async task for each buffer
-            let task = tokio::spawn(async move {
-                // Генерируем случайные данные для буфера
-                let buffer_size_this_iteration = sectors_this_iteration as usize * sector_size as usize;
-                let mut buffer = vec![0u8; buffer_size_this_iteration];
-                OsRng.fill_bytes(&mut buffer);
+            Err(e) => {
+                warn!("Attempt {} to write volume header failed: {}", attempt, e);
+                // Пауза перед повторной попыткой
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 
-                // Шифруем в параллельных потоках
-                let chunks_size = sector_size as usize;
-                
-                // Parallel encryption of sectors within the buffer using rayon
-                buffer.par_chunks_mut(chunks_size)
-                    .enumerate()
-                    .for_each(|(j, sector_data)| {
-                        let sector_index = current_sector + j as u64;
-                        let _ = encrypt_sector(sector_data, sector_index, &xts_key_ref);
-                    });
-                
-                // Записываем зашифрованные секторы на устройство
-                {
-                    let mut volume_guard = volume_ref.lock().unwrap();
-                    if let Err(e) = volume_guard.write_sectors(current_sector, sector_size, &buffer) {
-                        log::error!("Failed to write sectors at {}: {}", current_sector, e);
-                        return Err(anyhow::anyhow!("Write operation failed: {}", e));
-                    }
-                }
-                
-                // Update progress
-                {
-                    let mut progress = progress_counter_ref.lock().unwrap();
-                    *progress = *progress + 1;
-                    
-                    // Also update the total bytes encrypted
-                    let mut bytes = encrypted_bytes_ref.lock().unwrap();
-                    *bytes += buffer_size_this_iteration as u64;
-                }
-                
-                // Drop permit automatically when the task completes
-                drop(permit);
-                
-                // Return success
-                Ok::<_, anyhow::Error>(())
-            });
-            
-            futures.push(task);
-            
-            // Limit the number of spawned tasks to avoid memory pressure
-            if futures.len() >= num_cpus * 2 {
-                if let Some(result) = futures.next().await {
-                    match result {
-                        Ok(Ok(_)) => {}, // Task completed successfully
-                        Ok(Err(e)) => return Err(e), // Task returned an error
-                        Err(e) => return Err(anyhow::anyhow!("Task panicked: {}", e)),
-                    }
+                // На последней попытке делаем дополнительную очистку
+                if attempt == 4 {
+                    warn!("Trying more aggressive disk wiping before final attempt");
+                    let big_zero = vec![0u8; 4096];
+                    let _ = volume.write_at(0, &big_zero); // Игнорируем возможную ошибку
                 }
             }
         }
-        
-        // Wait for all remaining tasks to complete
-        while let Some(result) = futures.next().await {
-            match result {
-                Ok(Ok(_)) => {}, // Task completed successfully
-                Ok(Err(e)) => return Err(e), // Task returned an error
-                Err(e) => return Err(anyhow::anyhow!("Task panicked: {}", e)),
-            }
-        }
-        
-        // Wait for progress reporting task to finish
-        let _ = progress_task.await;
-        
-        log::info!("Encryption completed successfully!");
-        Ok(())
-    })
+    }
+    
+    if !success {
+        bail!("Failed to write volume header after multiple attempts. Device may be write-protected or locked by system.");
+    }
+    
+    // Определяем количество потоков для параллельного шифрования
+    let num_threads = std::cmp::min(
+        num_cpus::get(),
+        8 // Ограничиваем максимум 8 потоками для стабильности
+    );
+    info!("Using {} threads for parallel encryption", num_threads);
+    
+    // Шифруем все сектора данных
+    info!("Starting parallel encryption of all data sectors");
+    let encryption_result = encrypt_sectors_parallel(&mut volume, &encryption_key, num_threads, sector_size)?;
+    
+    // Выводим информацию о результатах шифрования
+    let elapsed = encryption_result.duration.as_secs_f64();
+    let mb_per_sec = if elapsed > 0.0 {
+        (encryption_result.bytes_processed as f64 / (1024.0 * 1024.0)) / elapsed
+    } else {
+        0.0
+    };
+    
+    info!("Encryption completed successfully");
+    info!("Processed {} sectors ({} bytes) in {:.2} seconds",
+         encryption_result.sectors_processed,
+         encryption_result.bytes_processed,
+         elapsed);
+    info!("Average speed: {:.2} MB/sec", mb_per_sec);
+    
+    Ok(())
 }
 
 /// Реализация для VolumeHeader
@@ -517,6 +613,22 @@ impl VolumeHeader {
                   serialized.len(), sector_size);
         }
         
+        // Дополнительная проверка доступа к первому сектору
+        // Попытка очистить начало диска перед записью заголовка
+        let mut zero_buffer = vec![0u8; 512]; // Очищаем только MBR (первые 512 байт)
+        
+        // Пробуем сначала записать нули в первый сектор
+        match volume.write_sectors(0, sector_size, &zero_buffer) {
+            Ok(_) => {
+                debug!("Successfully cleared first sector before writing header");
+            },
+            Err(e) => {
+                // Предупреждение о возможных проблемах доступа, но продолжаем
+                warn!("Warning: Could not clear first sector (MBR): {}", e);
+                warn!("Will attempt to write header directly. If this fails, you may need to format the disk as GPT first.");
+            }
+        }
+        
         // Создаем буфер размером в сектор
         let mut sector_buffer = vec![0u8; sector_size as usize];
         
@@ -524,8 +636,14 @@ impl VolumeHeader {
         sector_buffer[..serialized.len()].copy_from_slice(&serialized);
         
         // Записываем в сектор 0
-        volume.write_sectors(0, sector_size, &sector_buffer)
-            .context("Ошибка записи заголовка тома")
+        match volume.write_sectors(0, sector_size, &sector_buffer) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("Ошибка записи заголовка тома: {}", e);
+                error!("Диск может иметь защиту записи или требуется предварительная очистка через diskpart (clean)");
+                Err(anyhow!("Ошибка записи заголовка тома: {}", e))
+            }
+        }
     }
     
     /// Читает заголовок тома из указанного файла-контейнера

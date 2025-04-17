@@ -1,63 +1,71 @@
-# UniFortress
+# UniFortress Disk Encryption Utility
 
-UniFortress - это кроссплатформенное решение для шифрования USB-накопителей, аналогичное BitLocker, но разработанное для работы на различных операционных системах, включая Windows, macOS, Linux, iOS и Android.
+A cross-platform utility for disk encryption, mounting, and management.
 
-## Возможности
+## Requirements
 
-- Шифрование AES-256-XTS для безопасного хранения
-- Кроссплатформенная совместимость
-- Аутентификация на основе пароля с использованием алгоритма Argon2id для формирования ключа
-- Проверка целостности заголовка тома с помощью HMAC
-- Портативная конструкция, не требующая установки на хост-системе (для настольных платформ)
+- Windows: PowerShell
+- Unix/Linux: Bash shell, sudo privileges
 
-## Использование
+## Usage
 
-### Шифрование физического диска
+### Windows
 
-Для шифрования физического USB-накопителя:
-
-1. Подключите USB-накопитель к компьютеру
-2. Запустите основное приложение:
-
-```bash
-unifortress encrypt --device <путь_к_устройству>
+First, set execution permissions:
+```
+.\set-permissions.ps1
 ```
 
-3. Следуйте инструкциям на экране для создания пароля и шифрования диска
-
-### Доступ к зашифрованному диску
-
-Для монтирования зашифрованного диска:
-
-```bash
-unifortress mount --device <путь_к_устройству> --password <пароль> --mount_point <точка_монтирования>
+Then use the PowerShell script:
+```
+.\unifortress.ps1 [command] [parameters]
 ```
 
-После ввода правильного пароля диск будет смонтирован и доступен по указанному пути.
-
-Для размонтирования зашифрованного диска:
-
-```bash
-unifortress unmount --mount_point <точка_монтирования>
+Or use the batch files directly:
+```
+.\list_devices.bat
+.\test_encrypt_disk.bat [disk_number]
+.\test_check_disk.bat [disk_number]
+.\test_mount_disk.bat [disk_number]
 ```
 
-### Проверка зашифрованного диска
+### Unix/Linux
 
-Для проверки, что диск зашифрован корректно и пароль подходит:
-
-```bash
-unifortress check --device <путь_к_устройству>
+Make the scripts executable first:
+```
+chmod +x *.sh
 ```
 
-### Сборка проекта
+Then use the universal launcher:
+```
+./unifortress.sh [command] [parameters]
+```
 
-Для создания оптимизированных исполняемых файлов:
+Or use the individual scripts:
+```
+./list_devices.sh
+./encrypt_disk.sh [disk_number]
+./check_disk.sh [disk_number]
+./mount_disk.sh [disk_number]
+```
 
-```bash
+## Available Commands
+
+- `list` - List available devices
+- `encrypt [disk_number]` - Encrypt a disk
+- `check [disk_number]` - Check disk encryption status
+- `mount [disk_number]` - Mount an encrypted disk
+- `unmount [disk_number]` - Unmount an encrypted disk
+
+## Warning
+
+Disk encryption operations can potentially result in data loss. Always back up important data before performing encryption operations.
+
+## Building from Source
+
+```
 cargo build --release
 ```
-
-Бинарные файлы будут доступны в каталоге `target/release`.
 
 ## Системные требования
 
